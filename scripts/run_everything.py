@@ -4,7 +4,8 @@
 The script performs a CPU smoke test first, then runs the selected GPU
 training pipeline, generates result.txt, and finally packages result.zip.
 
-Default mode: cached dual-path training (phases 1, 2, 3).
+Default mode: official data prep + raw dual-path training (phases 1, 2, 3)
+with annotation supervision enabled when available.
 """
 
 from __future__ import annotations
@@ -163,8 +164,37 @@ def validate_pairuav_root(pairuav_root: Path) -> tuple[int, int]:
     return len(pairs), len(unique_images)
 
 
-def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path) -> None:
-    from data.dataset import PairDataset, resolve_train_view_dir
+def has_annotation_json(directory: Path) -> bool:
+    if not directory.is_dir():
+        return False
+    if any(path.is_file() for path in directory.glob("*.json")):
+        return True
+    for child in directory.iterdir():
+        if child.is_dir() and any(path.is_file() for path in child.glob("*.json")):
+            return True
+    return False
+
+
+def has_training_images(root: Path) -> bool:
+    image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+    candidate_dirs = [root / "train_tour", root / "train" / "drone"]
+    for candidate in candidate_dirs:
+        if not candidate.is_dir():
+            continue
+        for path in candidate.rglob("*"):
+            if path.is_file() and path.suffix.lower() in image_suffixes:
+                return True
+    return False
+
+
+def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path,
+                    official_annotations: bool = False) -> None:
+    from data.dataset import (
+        PairDataset,
+        PairUAVAnnotationDataset,
+        resolve_train_annotation_dir,
+        resolve_train_view_dir,
+    )
     from models.baseline import PairUAVBaseline, baseline_total_loss
     from models.harp_dual_path import HARPDualPath
     from models.harp_pose_lite import HARPPoseLite, harp_pose_lite_loss
@@ -212,6 +242,22 @@ def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path) -> None
         )
 
     check("raw dataset sample", raw_dataset_sample)
+
+    if official_annotations:
+        def annotation_dataset_sample() -> str:
+            annotation_root = resolve_train_annotation_dir(pairuav_root)
+            if annotation_root is None:
+                raise RuntimeError(
+                    f"Official annotation mode requested, but train annotations were not found under {pairuav_root}"
+                )
+            dataset = PairUAVAnnotationDataset(str(pairuav_root), max_pairs=2, seed=42, is_val=True)
+            source, target, meta = dataset[0]
+            return (
+                f"source={tuple(source.shape)} target={tuple(target.shape)} "
+                f"heading={meta['heading']:.3f} distance={meta['distance']:.3f}"
+            )
+
+        check("official annotation sample", annotation_dataset_sample)
 
     def pairuav_layout() -> str:
         test_json_files, test_images = validate_pairuav_root(pairuav_root)
@@ -327,12 +373,40 @@ def package_submission(result_txt: Path, result_zip: Path) -> None:
         archive.write(result_txt, arcname="result.txt")
 
 
+def has_prepared_pairuav_layout(root: Path) -> bool:
+    """Return True when root looks like official processed PairUAV data."""
+    train_dir = root / "train"
+    test_dir = root / "test"
+    has_train_view = has_training_images(root)
+    has_train_annotations = has_annotation_json(train_dir)
+    has_test_annotations = has_annotation_json(test_dir)
+    has_test_tour = (root / "test_tour").is_dir()
+    return has_train_view and has_train_annotations and has_test_annotations and has_test_tour
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verbose end-to-end PairUAV runner")
     parser.add_argument("--university-release", default=None,
                         help="Path to the raw University-Release root; auto-detected from the mounted AutoDL dataset when omitted")
     parser.add_argument("--pairuav-root", default=None,
                         help="Path to the PairUAV submission root; auto-detected from mounted AutoDL data when omitted")
+    parser.add_argument("--prepare-data", type=parse_bool_arg, default=True,
+                        help="Run official PairUAV data preparation stage before training (true/false)")
+    parser.add_argument("--prepare-workdir", default=None,
+                        help="Work directory for official data prep (defaults to --pairuav-root or /root/autodl-tmp/university/PairUAV)")
+    parser.add_argument("--university-zip", default=None,
+                        help="Path to University-Release.zip used by official data prep when needed")
+    parser.add_argument("--prep-download-tool", choices=["auto", "hf", "huggingface-cli", "python"],
+                        default="auto",
+                        help="Download backend for official data prep")
+    parser.add_argument("--prep-dataset-repo", default="YaxuanLi/UAVM_2026_test",
+                        help="Hugging Face dataset repo used by official data prep")
+    parser.add_argument("--hf-token", default=None,
+                        help="Optional Hugging Face token for data prep download")
+    parser.add_argument("--skip-prep-download", action="store_true",
+                        help="Skip Hugging Face download in official data prep")
+    parser.add_argument("--skip-prep-extract", action="store_true",
+                        help="Skip tar extraction in official data prep")
     parser.add_argument("--mode", choices=["dual-path", "phase1-lite"], default="dual-path",
                         help="Training pipeline to run")
     parser.add_argument("--phases", default="1,2,3",
@@ -355,37 +429,12 @@ def main() -> None:
                         help="Model to train in phase1-lite mode")
     parser.add_argument("--workers", type=int, default=16,
                         help="DataLoader workers to pass to training scripts")
-    parser.add_argument("--raw", type=parse_bool_arg, default=False,
+    parser.add_argument("--raw", type=parse_bool_arg, default=True,
                         help="Use raw-image dual-path training instead of cached features (true/false)")
+    parser.add_argument("--official-annotations", type=parse_bool_arg, default=True,
+                        help="Enable official annotation supervision for raw dual-path training (true/false)")
     args = parser.parse_args()
 
-    raw_root = resolve_data_root(
-        args.university_release,
-        description="University-Release root",
-        env_names=("PAIRUAV_UNIVERSITY_RELEASE", "UNIVERSITY_RELEASE_ROOT", "UNIVERSITY_RELEASE"),
-        candidates=(
-            Path("/root/autodl-tmp/university/University-Release/University-Release"),
-            Path("/root/autodl-tmp/university/University-Release"),
-            Path("/root/autodl-tmp/university/PairUAV"),
-            Path("/root/autodl-tmp/university/pairUAV"),
-            Path("/root/autodl-tmp/university/PairUAV-Processed"),
-        ),
-    )
-    requested_pairuav_root = Path(args.pairuav_root).expanduser() if args.pairuav_root else None
-    pairuav_root = resolve_data_root(
-        args.pairuav_root,
-        description="PairUAV submission root",
-        env_names=("PAIRUAV_ROOT", "PAIRUAV_DATA_ROOT", "PAIRUAV_PROCESSED_ROOT"),
-        candidates=(
-            raw_root,
-            Path("/root/autodl-tmp/university/PairUAV"),
-            Path("/root/autodl-tmp/university/PairUAV-Processed"),
-            Path("/root/autodl-pub/PairUAV"),
-        ),
-        allow_fallback_if_missing=True,
-    )
-    if requested_pairuav_root is not None and not requested_pairuav_root.is_dir():
-        print(f"Note: --pairuav-root {requested_pairuav_root} was not found; using detected root {pairuav_root}")
     run_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (REPO_ROOT / "runs" / now_stamp())
     run_root = ensure_dir(run_root)
     logs_dir = ensure_dir(run_root / "logs")
@@ -398,10 +447,90 @@ def main() -> None:
         "run_root": str(run_root),
         "mode": args.mode,
         "raw_training": bool(args.raw),
-        "raw_root": str(raw_root),
-        "pairuav_root": str(pairuav_root),
+        "prepare_data": bool(args.prepare_data),
         "stages": [],
     }
+
+    requested_pairuav_root = Path(args.pairuav_root).expanduser() if args.pairuav_root else None
+
+    if args.prepare_data:
+        if args.prepare_workdir:
+            prep_workdir = Path(args.prepare_workdir).expanduser().resolve()
+        elif requested_pairuav_root is not None:
+            prep_workdir = requested_pairuav_root.resolve()
+        else:
+            prep_workdir = Path(
+                os.environ.get("PAIRUAV_ROOT", "/root/autodl-tmp/university/PairUAV")
+            ).expanduser().resolve()
+
+        ensure_dir(prep_workdir)
+
+        if has_prepared_pairuav_layout(prep_workdir) and not args.skip_prep_download and not args.skip_prep_extract:
+            print(f"Official prep detected existing processed layout at {prep_workdir}; skipping data-prep stage.")
+        else:
+            prep_log = logs_dir / "00_data_prep.log"
+            prep_cmd = [
+                sys.executable,
+                "-u",
+                str(REPO_ROOT / "scripts" / "prepare_pairuav_data.py"),
+                "--workdir",
+                str(prep_workdir),
+                "--download-tool",
+                args.prep_download_tool,
+                "--dataset-repo",
+                args.prep_dataset_repo,
+            ]
+            if args.university_zip:
+                prep_cmd.extend(["--university-zip", str(Path(args.university_zip).expanduser())])
+            if args.university_release:
+                prep_cmd.extend(["--university-release-root", str(Path(args.university_release).expanduser())])
+            if args.hf_token:
+                prep_cmd.extend(["--hf-token", args.hf_token])
+            if args.skip_prep_download:
+                prep_cmd.append("--skip-download")
+            if args.skip_prep_extract:
+                prep_cmd.append("--skip-extract")
+
+            run_command(prep_cmd, REPO_ROOT, prep_log, "data-prep")
+            summary["stages"].append({
+                "name": "data_prep",
+                "status": "passed",
+                "log": str(prep_log),
+                "workdir": str(prep_workdir),
+            })
+
+        raw_root = prep_workdir
+        pairuav_root = prep_workdir
+    else:
+        raw_root = resolve_data_root(
+            args.university_release,
+            description="University-Release root",
+            env_names=("PAIRUAV_UNIVERSITY_RELEASE", "UNIVERSITY_RELEASE_ROOT", "UNIVERSITY_RELEASE"),
+            candidates=(
+                Path("/root/autodl-tmp/university/University-Release/University-Release"),
+                Path("/root/autodl-tmp/university/University-Release"),
+                Path("/root/autodl-tmp/university/PairUAV"),
+                Path("/root/autodl-tmp/university/pairUAV"),
+                Path("/root/autodl-tmp/university/PairUAV-Processed"),
+            ),
+        )
+        pairuav_root = resolve_data_root(
+            args.pairuav_root,
+            description="PairUAV submission root",
+            env_names=("PAIRUAV_ROOT", "PAIRUAV_DATA_ROOT", "PAIRUAV_PROCESSED_ROOT"),
+            candidates=(
+                raw_root,
+                Path("/root/autodl-tmp/university/PairUAV"),
+                Path("/root/autodl-tmp/university/PairUAV-Processed"),
+                Path("/root/autodl-pub/PairUAV"),
+            ),
+            allow_fallback_if_missing=True,
+        )
+        if requested_pairuav_root is not None and not requested_pairuav_root.is_dir():
+            print(f"Note: --pairuav-root {requested_pairuav_root} was not found; using detected root {pairuav_root}")
+
+    summary["raw_root"] = str(raw_root)
+    summary["pairuav_root"] = str(pairuav_root)
 
     print(f"Run directory: {run_root}")
     print(f"Mode: {args.mode}")
@@ -409,11 +538,16 @@ def main() -> None:
     print(f"PairUAV root: {pairuav_root}")
     print()
 
-    cpu_log = logs_dir / "00_cpu_smoke.log"
+    cpu_log = logs_dir / f"{len(summary['stages']):02d}_cpu_smoke.log"
     cpu_start = time.time()
     try:
         with cpu_log.open("w", encoding="utf-8") as smoke_handle:
-            cpu_smoke_check(raw_root, pairuav_root, smoke_handle)
+            cpu_smoke_check(
+                raw_root,
+                pairuav_root,
+                smoke_handle,
+                official_annotations=bool(args.raw and args.official_annotations),
+            )
         cpu_status = "passed"
     except Exception as exc:  # noqa: BLE001
         cpu_status = "failed"
@@ -507,7 +641,7 @@ def main() -> None:
                         "--raw", "true",
                         "--university-release", str(raw_root),
                         "--annotations-root", str(pairuav_root),
-                        "--official-annotations", "auto",
+                        "--official-annotations", "true" if args.official_annotations else "false",
                     ])
                 else:
                     train_cmd.extend(["--cache", str(cache_train_dir)])

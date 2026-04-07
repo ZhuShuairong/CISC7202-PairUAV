@@ -32,10 +32,11 @@ def emit(message: str) -> None:
     print(message, flush=True)
 
 
-def resolve_university_root(workdir: Path) -> Path | None:
+def resolve_university_root_from_path(base_path: Path) -> Path | None:
     candidates = [
-        workdir / "University-Release",
-        workdir / "University-Release" / "University-Release",
+        base_path,
+        base_path / "University-Release",
+        base_path / "University-Release" / "University-Release",
     ]
     for root in candidates:
         if (root / "train" / "drone").is_dir():
@@ -43,7 +44,23 @@ def resolve_university_root(workdir: Path) -> Path | None:
     return None
 
 
-def maybe_unzip_university_release(workdir: Path, university_zip: Path) -> Path:
+def resolve_university_root(workdir: Path) -> Path | None:
+    return resolve_university_root_from_path(workdir)
+
+
+def maybe_unzip_university_release(workdir: Path,
+                                   university_zip: Path,
+                                   external_university_root: Path | None = None) -> Path:
+    if external_university_root is not None:
+        resolved_external = resolve_university_root_from_path(external_university_root)
+        if resolved_external is None:
+            raise FileNotFoundError(
+                "--university-release-root was provided, but train/drone was not found under "
+                f"{external_university_root}."
+            )
+        emit(f"[prep] Using existing University-Release root {resolved_external}")
+        return resolved_external.resolve()
+
     root = resolve_university_root(workdir)
     if root is not None:
         emit(f"[prep] Found University-Release at {root}")
@@ -252,6 +269,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to University-Release.zip (defaults to <workdir>/University-Release.zip)",
     )
     parser.add_argument(
+        "--university-release-root",
+        type=Path,
+        default=None,
+        help="Path to an existing extracted University-Release root to copy from",
+    )
+    parser.add_argument(
         "--dataset-repo",
         type=str,
         default=DEFAULT_DATASET_REPO,
@@ -307,6 +330,10 @@ def main() -> None:
     workdir = args.workdir.expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
+    external_university_root = None
+    if args.university_release_root is not None:
+        external_university_root = args.university_release_root.expanduser().resolve()
+
     if args.university_zip:
         university_zip = args.university_zip.expanduser()
         if not university_zip.is_absolute():
@@ -319,7 +346,11 @@ def main() -> None:
     emit("[prep] PairUAV official-style preparation started")
     emit(f"[prep] Workdir: {workdir}")
 
-    university_root = maybe_unzip_university_release(workdir, university_zip)
+    university_root = maybe_unzip_university_release(
+        workdir,
+        university_zip,
+        external_university_root=external_university_root,
+    )
     copy_train_tour(university_root, workdir)
 
     if args.skip_download:
