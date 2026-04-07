@@ -57,15 +57,20 @@ def ensure_dir(path: Path) -> Path:
 
 def resolve_data_root(value: str | None, *, description: str,
                       env_names: tuple[str, ...],
-                      candidates: tuple[Path, ...]) -> Path:
-    if value:
-        explicit = Path(value).expanduser()
-        if explicit.is_dir():
-            return explicit.resolve()
-        raise FileNotFoundError(f"{description} does not exist: {explicit}")
-
+                      candidates: tuple[Path, ...],
+                      allow_fallback_if_missing: bool = False) -> Path:
     checked: list[Path] = []
     seen: set[str] = set()
+
+    if value:
+        explicit = Path(value).expanduser()
+        key = str(explicit)
+        seen.add(key)
+        checked.append(explicit)
+        if explicit.is_dir():
+            return explicit.resolve()
+        if not allow_fallback_if_missing:
+            raise FileNotFoundError(f"{description} does not exist: {explicit}")
 
     for env_name in env_names:
         env_value = os.environ.get(env_name)
@@ -352,17 +357,21 @@ def main() -> None:
             Path("/root/autodl-tmp/university/University-Release"),
         ),
     )
+    requested_pairuav_root = Path(args.pairuav_root).expanduser() if args.pairuav_root else None
     pairuav_root = resolve_data_root(
         args.pairuav_root,
         description="PairUAV submission root",
         env_names=("PAIRUAV_ROOT", "PAIRUAV_DATA_ROOT", "PAIRUAV_PROCESSED_ROOT"),
         candidates=(
+            raw_root,
             Path("/root/autodl-tmp/university/PairUAV"),
             Path("/root/autodl-tmp/university/PairUAV-Processed"),
             Path("/root/autodl-pub/PairUAV"),
-            raw_root,
         ),
+        allow_fallback_if_missing=True,
     )
+    if requested_pairuav_root is not None and not requested_pairuav_root.is_dir():
+        print(f"Note: --pairuav-root {requested_pairuav_root} was not found; using detected root {pairuav_root}")
     run_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (REPO_ROOT / "runs" / now_stamp())
     run_root = ensure_dir(run_root)
     logs_dir = ensure_dir(run_root / "logs")

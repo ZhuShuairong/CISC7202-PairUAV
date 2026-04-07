@@ -33,30 +33,31 @@ PAIR_MANIFEST_NAMES = (
 )
 
 DEFAULT_PAIRUAV_ROOT_CANDIDATES = (
+    Path("/root/autodl-tmp/university/University-Release/University-Release"),
     Path("/root/autodl-tmp/university/PairUAV"),
     Path("/root/autodl-tmp/university/PairUAV-Processed"),
     Path("/root/autodl-pub/PairUAV"),
-    Path("/root/autodl-tmp/university/University-Release/University-Release"),
 )
 
 
 def resolve_pairuav_root(root: str | None) -> Path:
-    if root:
-        explicit = Path(root).expanduser()
-        if explicit.is_dir():
-            return explicit.resolve()
-        raise FileNotFoundError(f"PairUAV root does not exist: {explicit}")
-
+    checked: list[Path] = []
+    seen: set[str] = set()
     candidates: list[Path] = []
     for env_name in ("PAIRUAV_ROOT", "PAIRUAV_DATA_ROOT", "PAIRUAV_PROCESSED_ROOT"):
         value = os.environ.get(env_name)
         if value:
             candidates.append(Path(value).expanduser())
 
+    if root:
+        explicit = Path(root).expanduser()
+        checked.append(explicit)
+        seen.add(str(explicit))
+        if explicit.is_dir():
+            return explicit.resolve()
+
     candidates.extend(DEFAULT_PAIRUAV_ROOT_CANDIDATES)
 
-    checked: list[Path] = []
-    seen: set[str] = set()
     for candidate in candidates:
         key = str(candidate)
         if key in seen:
