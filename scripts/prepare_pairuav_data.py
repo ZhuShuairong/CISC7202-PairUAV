@@ -25,6 +25,7 @@ import zipfile
 from pathlib import Path
 
 DEFAULT_DATASET_REPO = "YaxuanLi/UAVM_2026_test"
+DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 REQUIRED_ARCHIVES = ("train.tar", "test.tar", "test_tour.tar")
 
 
@@ -108,42 +109,53 @@ def copy_train_tour(university_root: Path, workdir: Path) -> int:
     return copied_items
 
 
-def _run_download_command(command: list[str], workdir: Path, token: str | None) -> None:
+def _run_download_command(command: list[str], workdir: Path, token: str | None,
+                          hf_endpoint: str | None) -> None:
     env = os.environ.copy()
     if token:
         env["HF_TOKEN"] = token
         env["HUGGINGFACE_HUB_TOKEN"] = token
+    if hf_endpoint:
+        env["HF_ENDPOINT"] = hf_endpoint
 
     emit("[prep] Running: " + " ".join(command))
     subprocess.run(command, cwd=str(workdir), check=True, env=env)
 
 
-def _download_archives_with_hf(workdir: Path, repo_id: str, token: str | None) -> None:
+def _download_archives_with_hf(workdir: Path, repo_id: str, token: str | None,
+                               hf_endpoint: str | None) -> None:
     if shutil.which("hf") is None:
         raise RuntimeError("hf CLI was not found")
     _run_download_command(
         ["hf", "download", "--repo-type", "dataset", repo_id, "--local-dir", str(workdir)],
         workdir,
         token,
+        hf_endpoint,
     )
 
 
-def _download_archives_with_huggingface_cli(workdir: Path, repo_id: str, token: str | None) -> None:
+def _download_archives_with_huggingface_cli(workdir: Path, repo_id: str, token: str | None,
+                                            hf_endpoint: str | None) -> None:
     if shutil.which("huggingface-cli") is None:
         raise RuntimeError("huggingface-cli was not found")
     _run_download_command(
         ["huggingface-cli", "download", "--repo-type", "dataset", repo_id, "--local-dir", str(workdir)],
         workdir,
         token,
+        hf_endpoint,
     )
 
 
-def _download_archives_with_python(workdir: Path, repo_id: str, token: str | None) -> None:
+def _download_archives_with_python(workdir: Path, repo_id: str, token: str | None,
+                                   hf_endpoint: str | None) -> None:
     try:
         import importlib
         snapshot_download = importlib.import_module("huggingface_hub").snapshot_download
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError("huggingface_hub is not installed") from exc
+
+    if hf_endpoint:
+        os.environ["HF_ENDPOINT"] = hf_endpoint
 
     emit("[prep] Downloading archives with huggingface_hub.snapshot_download ...")
     kwargs = {
@@ -170,7 +182,8 @@ def has_required_archives(workdir: Path) -> bool:
     return all(path.is_file() for path in archive_paths(workdir))
 
 
-def download_archives(workdir: Path, repo_id: str, token: str | None, tool: str) -> str:
+def download_archives(workdir: Path, repo_id: str, token: str | None, tool: str,
+                      hf_endpoint: str | None) -> str:
     if has_required_archives(workdir):
         emit("[prep] Required archives already exist; skipping download")
         return "skipped"
@@ -181,11 +194,11 @@ def download_archives(workdir: Path, repo_id: str, token: str | None, tool: str)
     for candidate in tools:
         try:
             if candidate == "hf":
-                _download_archives_with_hf(workdir, repo_id, token)
+                _download_archives_with_hf(workdir, repo_id, token, hf_endpoint)
             elif candidate == "huggingface-cli":
-                _download_archives_with_huggingface_cli(workdir, repo_id, token)
+                _download_archives_with_huggingface_cli(workdir, repo_id, token, hf_endpoint)
             elif candidate == "python":
-                _download_archives_with_python(workdir, repo_id, token)
+                _download_archives_with_python(workdir, repo_id, token, hf_endpoint)
             else:
                 raise ValueError(f"Unsupported download tool: {candidate}")
 
@@ -281,6 +294,12 @@ def parse_args() -> argparse.Namespace:
         help="Hugging Face dataset repo ID for competition archives",
     )
     parser.add_argument(
+        "--hf-endpoint",
+        type=str,
+        default=None,
+        help=f"Hugging Face endpoint override (defaults to {DEFAULT_HF_ENDPOINT})",
+    )
+    parser.add_argument(
         "--download-tool",
         choices=["auto", "hf", "huggingface-cli", "python"],
         default="auto",
@@ -342,9 +361,12 @@ def main() -> None:
     else:
         university_zip = workdir / "University-Release.zip"
     token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+    hf_endpoint = args.hf_endpoint or os.environ.get("HF_ENDPOINT") or DEFAULT_HF_ENDPOINT
+    os.environ["HF_ENDPOINT"] = hf_endpoint
 
     emit("[prep] PairUAV official-style preparation started")
     emit(f"[prep] Workdir: {workdir}")
+    emit(f"[prep] HF endpoint: {hf_endpoint}")
 
     university_root = maybe_unzip_university_release(
         workdir,
@@ -361,7 +383,7 @@ def main() -> None:
                 f"Expected: {', '.join(REQUIRED_ARCHIVES)} in {workdir}."
             )
     else:
-        download_archives(workdir, args.dataset_repo, token, args.download_tool)
+        download_archives(workdir, args.dataset_repo, token, args.download_tool, hf_endpoint)
 
     if args.skip_extract:
         emit("[prep] Skip extract enabled")

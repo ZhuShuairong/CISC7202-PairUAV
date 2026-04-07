@@ -14,6 +14,15 @@ import sys
 from pathlib import Path
 
 
+DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
+
+
+def resolve_hf_endpoint() -> str:
+    hf_endpoint = os.environ.get("HF_ENDPOINT") or DEFAULT_HF_ENDPOINT
+    os.environ["HF_ENDPOINT"] = hf_endpoint
+    return hf_endpoint
+
+
 def main():
     # Import torch inside main to avoid import error if not installed yet
     try:
@@ -26,9 +35,11 @@ def main():
     parser.add_argument('--out', type=str, default='checkpoints/',
                        help='Output directory for weights')
     args = parser.parse_args()
+    hf_endpoint = resolve_hf_endpoint()
 
     os.makedirs(args.out, exist_ok=True)
     print(f"Downloading weights to {args.out}...")
+    print(f"Using HF endpoint: {hf_endpoint}")
     print()
     
     all_ok = True

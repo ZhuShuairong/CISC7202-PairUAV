@@ -27,6 +27,7 @@ from typing import Callable, Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 sys.path.insert(0, str(REPO_ROOT))
 
 
@@ -49,6 +50,12 @@ def emit(message: str, log_file=None) -> None:
     if log_file is not None:
         log_file.write(message + "\n")
         log_file.flush()
+
+
+def resolve_hf_endpoint() -> str:
+    hf_endpoint = os.environ.get("HF_ENDPOINT") or DEFAULT_HF_ENDPOINT
+    os.environ["HF_ENDPOINT"] = hf_endpoint
+    return hf_endpoint
 
 
 def ensure_dir(path: Path) -> Path:
@@ -434,6 +441,7 @@ def main() -> None:
     parser.add_argument("--official-annotations", type=parse_bool_arg, default=True,
                         help="Enable official annotation supervision for raw dual-path training (true/false)")
     args = parser.parse_args()
+    hf_endpoint = resolve_hf_endpoint()
 
     run_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (REPO_ROOT / "runs" / now_stamp())
     run_root = ensure_dir(run_root)
@@ -448,6 +456,7 @@ def main() -> None:
         "mode": args.mode,
         "raw_training": bool(args.raw),
         "prepare_data": bool(args.prepare_data),
+        "hf_endpoint": hf_endpoint,
         "stages": [],
     }
 
@@ -536,6 +545,7 @@ def main() -> None:
     print(f"Mode: {args.mode}")
     print(f"Raw root: {raw_root}")
     print(f"PairUAV root: {pairuav_root}")
+    print(f"HF endpoint: {hf_endpoint}")
     print()
 
     cpu_log = logs_dir / f"{len(summary['stages']):02d}_cpu_smoke.log"
