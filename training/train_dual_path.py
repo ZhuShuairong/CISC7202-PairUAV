@@ -26,6 +26,15 @@ def get_amp_dtype():
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
+def parse_bool_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
+
+
 def cosine_lr(epoch, total, warmup, base):
     if epoch < warmup:
         return base * (epoch + 1) / warmup
@@ -46,14 +55,34 @@ def wide_forward(model, batch, dev):
     return pred, {"heading": th, "distance": td}
 
 
-def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scaler):
+def raw_forward(model, batch, dev):
+    source, target, meta = batch
+    source = source.to(dev, non_blocking=True)
+    target = target.to(dev, non_blocking=True)
+    if source.ndim == 4:
+        source = source.contiguous(memory_format=torch.channels_last)
+        target = target.contiguous(memory_format=torch.channels_last)
+    th = torch.as_tensor(meta["heading"], dtype=torch.float32, device=dev)
+    td = torch.as_tensor(meta["distance"], dtype=torch.float32, device=dev)
+    pred = model(source, target)
+    return pred, {"heading": th, "distance": td}
+
+
+def forward_batch(model, batch, dev, use_raw: bool):
+    if use_raw:
+        return raw_forward(model, batch, dev)
+    return wide_forward(model, batch, dev)
+
+
+def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scaler, use_raw: bool):
     model.train()
+    model.phase = 1 if phase == 1 else 2
     t_loss, t_angle, n = 0.0, 0.0, 0
     for batch in loader:
         lr = cosine_lr(ep, total_ep, 3, list(optim.param_groups)[0]["lr"])
         optim.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            pred, tgt = wide_forward(model, batch, dev)
+            pred, tgt = forward_batch(model, batch, dev, use_raw)
             if phase == 1:
                 losses = phase1_loss(pred, tgt)
             elif phase == 2:
@@ -82,12 +111,13 @@ def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scale
 
 
 @torch.no_grad()
-def validate(model, loader, dev, amp_dtype):
-    model.eval(); model.phase = 2
+def validate(model, loader, dev, amp_dtype, phase: int, use_raw: bool):
+    model.eval()
+    model.phase = 1 if phase == 1 else 2
     e_h, e_d, sr, total = 0.0, 0.0, 0, 0
     for batch in loader:
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            pred, tgt = wide_forward(model, batch, dev)
+            pred, tgt = forward_batch(model, batch, dev, use_raw)
         eh = (pred["heading"] - tgt["heading"]).abs()
         eh = torch.where(eh > 180, 360 - eh, eh)
         ed = (pred["distance"] - tgt["distance"]).abs()
@@ -103,14 +133,24 @@ def validate(model, loader, dev, amp_dtype):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--cache", type=str, required=True)
+    p.add_argument("--cache", type=str, default=None)
+    p.add_argument("--university-release", "--data", dest="university_release",
+                   type=str, default=None,
+                   help="Path to University-Release root (required when --raw true)")
     p.add_argument("--phase", type=int, choices=[1,2,3])
     p.add_argument("--epochs", type=int); p.add_argument("--batch-size", type=int)
     p.add_argument("--lr", type=float)
     p.add_argument("--checkpoint", type=str, default="checkpoints/dual_path.pt")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--workers", type=int, default=16)
+    p.add_argument("--raw", type=parse_bool_arg, default=False,
+                   help="Use raw-image training path instead of cached features (true/false)")
     args = p.parse_args()
+
+    if args.raw and not args.university_release:
+        raise ValueError("--university-release is required when --raw true")
+    if not args.raw and not args.cache:
+        raise ValueError("--cache is required when --raw false")
 
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True
@@ -127,11 +167,26 @@ def main():
     bs = args.batch_size or c["bs"]
     lr = args.lr or c["lr"]
 
-    all_bld = sorted(f.stem for f in Path(args.cache).glob("*.npz"))
-    tr = all_bld[:560]; va = all_bld[560:]
-    ds_tr = CachedDataset(args.cache, buildings=tr, max_pairs=960_000, seed=args.seed, preload=True)
-    ds_va = CachedDataset(args.cache, buildings=va, max_pairs=20_000,
-                          seed=args.seed+1, is_val=True, preload=True)
+    if args.raw:
+        from data.dataset import PairDataset, resolve_train_view_dir
+
+        view_dir = resolve_train_view_dir(Path(args.university_release))
+        all_bld = sorted(path.name for path in view_dir.iterdir() if path.is_dir())
+        tr = all_bld[:560]
+        va = all_bld[560:]
+        ds_tr = PairDataset(args.university_release, buildings=tr,
+                            max_pairs=960_000, seed=args.seed, is_val=False)
+        ds_va = PairDataset(args.university_release, buildings=va,
+                            max_pairs=20_000, seed=args.seed+1, is_val=True)
+    else:
+        all_bld = sorted(f.stem for f in Path(args.cache).glob("*.npz"))
+        tr = all_bld[:560]
+        va = all_bld[560:]
+        ds_tr = CachedDataset(args.cache, buildings=tr, max_pairs=960_000,
+                              seed=args.seed, preload=True)
+        ds_va = CachedDataset(args.cache, buildings=va, max_pairs=20_000,
+                              seed=args.seed+1, is_val=True, preload=True)
+
     loader_kwargs = dict(num_workers=args.workers, pin_memory=True)
     if args.workers > 0:
         loader_kwargs["persistent_workers"] = True
@@ -156,15 +211,16 @@ def main():
         [p for p in model.parameters() if p.requires_grad],
         lr=lr, weight_decay=0.01)
 
-    print(f"\nPhase {args.phase}: {ep} epochs, LR={lr}, BS={bs}")
+    mode_text = "raw-images" if args.raw else "cached-features"
+    print(f"\nPhase {args.phase}: {ep} epochs, LR={lr}, BS={bs} | input={mode_text}")
     best = float("inf")
 
     for e in range(ep):
         for pg in optim.param_groups:
             pg["lr"] = cosine_lr(e, ep, 3, lr)
         t0 = time.time()
-        tm = train_epoch(model, dl_tr, optim, dev, args.phase, e, ep, amp_dtype, scaler)
-        vm = validate(model, dl_va, dev, amp_dtype)
+        tm = train_epoch(model, dl_tr, optim, dev, args.phase, e, ep, amp_dtype, scaler, args.raw)
+        vm = validate(model, dl_va, dev, amp_dtype, args.phase, args.raw)
         print(f"Epoch {e+1}/{ep} ({time.time()-t0:.0f}s)  "
               f"Train L={tm['loss']:.4f} |  "
               f"Val MAE_H={vm['mae_heading']:.1f}°  "

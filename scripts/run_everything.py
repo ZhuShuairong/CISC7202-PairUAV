@@ -99,6 +99,15 @@ def resolve_data_root(value: str | None, *, description: str,
     raise FileNotFoundError(f"Could not determine {description}. Checked: {checked_text}")
 
 
+def parse_bool_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got: {value}")
+
+
 def format_command(command: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(command)
@@ -346,6 +355,8 @@ def main() -> None:
                         help="Model to train in phase1-lite mode")
     parser.add_argument("--workers", type=int, default=16,
                         help="DataLoader workers to pass to training scripts")
+    parser.add_argument("--raw", type=parse_bool_arg, default=False,
+                        help="Use raw-image dual-path training instead of cached features (true/false)")
     args = parser.parse_args()
 
     raw_root = resolve_data_root(
@@ -383,6 +394,7 @@ def main() -> None:
     summary: dict[str, object] = {
         "run_root": str(run_root),
         "mode": args.mode,
+        "raw_training": bool(args.raw),
         "raw_root": str(raw_root),
         "pairuav_root": str(pairuav_root),
         "stages": [],
@@ -450,29 +462,32 @@ def main() -> None:
         phases = [int(phase.strip()) for phase in args.phases.split(",") if phase.strip()]
         checkpoint_path = checkpoints_dir / "dual_path.pt"
 
-        cache_npz = list(cache_train_dir.glob("*.npz"))
-        if args.skip_cache and not cache_npz:
-            raise RuntimeError(
-                f"--skip-cache was set, but no cached .npz files were found in {cache_train_dir}."
-            )
+        if args.raw:
+            print("Raw dual-path mode enabled: skipping training cache extraction.")
+        else:
+            cache_npz = list(cache_train_dir.glob("*.npz"))
+            if args.skip_cache and not cache_npz:
+                raise RuntimeError(
+                    f"--skip-cache was set, but no cached .npz files were found in {cache_train_dir}."
+                )
 
-        if not args.skip_cache:
-            if cache_npz:
-                print(f"Cache already present ({len(cache_npz)} .npz files); skipping extraction.")
-            else:
-                cache_log = logs_dir / "01_cache_train.log"
-                cache_cmd = [
-                    sys.executable, "-u", str(REPO_ROOT / "utils" / "cache_features.py"),
-                    "--university-release", str(raw_root),
-                    "--cache", str(cache_train_dir),
-                    "--batch-size", str(args.cache_batch_size),
-                ]
-                run_command(cache_cmd, REPO_ROOT, cache_log, "cache-train")
-                summary["stages"].append({
-                    "name": "cache_train",
-                    "status": "passed",
-                    "log": str(cache_log),
-                })
+            if not args.skip_cache:
+                if cache_npz:
+                    print(f"Cache already present ({len(cache_npz)} .npz files); skipping extraction.")
+                else:
+                    cache_log = logs_dir / "01_cache_train.log"
+                    cache_cmd = [
+                        sys.executable, "-u", str(REPO_ROOT / "utils" / "cache_features.py"),
+                        "--university-release", str(raw_root),
+                        "--cache", str(cache_train_dir),
+                        "--batch-size", str(args.cache_batch_size),
+                    ]
+                    run_command(cache_cmd, REPO_ROOT, cache_log, "cache-train")
+                    summary["stages"].append({
+                        "name": "cache_train",
+                        "status": "passed",
+                        "log": str(cache_log),
+                    })
 
         if not args.skip_training:
             for index, phase in enumerate(phases, start=1):
@@ -480,11 +495,17 @@ def main() -> None:
                 train_log = logs_dir / f"{index + 1:02d}_{stage_name}.log"
                 train_cmd = [
                     sys.executable, "-u", str(train_script),
-                    "--cache", str(cache_train_dir),
                     "--phase", str(phase),
                     "--checkpoint", str(checkpoint_path),
                     "--workers", str(args.workers),
                 ]
+                if args.raw:
+                    train_cmd.extend([
+                        "--raw", "true",
+                        "--university-release", str(raw_root),
+                    ])
+                else:
+                    train_cmd.extend(["--cache", str(cache_train_dir)])
                 run_command(train_cmd, REPO_ROOT, train_log, stage_name)
                 summary["stages"].append({
                     "name": stage_name,
