@@ -1,0 +1,24 @@
+Challenge Report, PairUAV: Last-Meter Precision Navigation for UAVs
+(Optional)
+The submission website is at https://www.codabench.org/competitions/15251/. (registered with
+your student ID or your name).
+This year’s challenge focuses on **fine-grained last-meter UAV navigation**. Given a source
+image and a target image (PairUAV dataset derived from University-1652), participants are required
+to predict the relative angle (heading) and distance (translation) needed to align the UAV with the
+target pose.
+Since the course ends early, the deadline for course credit is April 30, 2026 at 23:59 PM. Please
+take a screenshot of your best result on the CodaBench leaderboard and submit it with a short
+technical report (e.g., which model do you use?) on UMoodle by this date.
+You are strongly encouraged to continue improving your model and submit to the official Cod-
+aBench competition until the final deadline (June 30, 2026 at 23:59 AoE) for the workshop awards.
+Dataset & Submission:
+• Request the University-1652 dataset and generate the PairUAV training set using the provided
+script (usually replied within 5 minutes).
+• Submission: Upload a zip file containing only result.txt at the root.
+• Each line in result.txt should contain: angle, distance (e.g., 120.5, 35.8).
+• The number of lines must exactly match the test set.
+Check the full challenge details and baseline on the CodaBench page: https://www.codabench.
+org/competitions/15251/
+The training dataset request: https://github.com/layumi/University1652-Baseline/blob/master/
+Request.md
+If you encounter any difficulties, please feel free to contact the TAs or me.
