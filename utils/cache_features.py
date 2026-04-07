@@ -4,6 +4,7 @@ Provides CachedDataset for training without the backbone in GPU memory.
 """
 import os
 import math
+import sys
 from pathlib import Path
 
 import torch
@@ -13,6 +14,8 @@ import torchvision.models as models
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from tqdm import tqdm
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.dataset import resolve_train_view_dir
 
