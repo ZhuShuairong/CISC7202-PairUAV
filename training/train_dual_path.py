@@ -26,6 +26,15 @@ def get_amp_dtype():
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
+def make_grad_scaler(use_fp16: bool):
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        try:
+            return torch.amp.GradScaler("cuda", enabled=use_fp16)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=use_fp16)
+    return torch.cuda.amp.GradScaler(enabled=use_fp16)
+
+
 def parse_bool_arg(value: str) -> bool:
     normalized = value.strip().lower()
     if normalized in {"1", "true", "t", "yes", "y", "on"}:
@@ -74,6 +83,14 @@ def forward_batch(model, batch, dev, use_raw: bool):
     return wide_forward(model, batch, dev)
 
 
+def compute_phase_losses(pred: dict, tgt: dict, phase: int) -> dict:
+    if phase == 1:
+        return phase1_loss(pred, tgt)
+    if phase == 2:
+        return phase2_loss(pred, tgt)
+    return laplace_nll(pred, tgt)
+
+
 def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scaler, use_raw: bool):
     model.train()
     model.phase = 1 if phase == 1 else 2
@@ -83,12 +100,7 @@ def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scale
         optim.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred, tgt = forward_batch(model, batch, dev, use_raw)
-            if phase == 1:
-                losses = phase1_loss(pred, tgt)
-            elif phase == 2:
-                losses = phase2_loss(pred, tgt)
-            else:
-                losses = laplace_nll(pred, tgt)
+            losses = compute_phase_losses(pred, tgt, phase)
 
         if scaler.is_enabled():
             scaler.scale(losses["total"]).backward()
@@ -115,9 +127,11 @@ def validate(model, loader, dev, amp_dtype, phase: int, use_raw: bool):
     model.eval()
     model.phase = 1 if phase == 1 else 2
     e_h, e_d, sr, total = 0.0, 0.0, 0, 0
+    v_loss, v_angle, n = 0.0, 0.0, 0
     for batch in loader:
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred, tgt = forward_batch(model, batch, dev, use_raw)
+            losses = compute_phase_losses(pred, tgt, phase)
         eh = (pred["heading"] - tgt["heading"]).abs()
         eh = torch.where(eh > 180, 360 - eh, eh)
         ed = (pred["distance"] - tgt["distance"]).abs()
@@ -126,9 +140,13 @@ def validate(model, loader, dev, amp_dtype, phase: int, use_raw: bool):
         sr += (ep_dist < 10).sum().item()
         B = tgt["heading"].shape[0]
         e_h += eh.sum().item(); e_d += ed.sum().item(); total += B
+        v_loss += losses["total"].item()
+        v_angle += losses.get("angle", torch.tensor(0.0)).item()
+        n += 1
     mae_h = e_h / total; mae_d = e_d / total
     return {"mae_heading": mae_h, "mae_distance": mae_d,
-            "avg": (mae_h + mae_d) / 2, "sr10": sr / total * 100}
+            "avg": (mae_h + mae_d) / 2, "sr10": sr / total * 100,
+            "val_loss": v_loss / max(n, 1), "val_angle_loss": v_angle / max(n, 1)}
 
 
 def main():
@@ -145,6 +163,14 @@ def main():
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--raw", type=parse_bool_arg, default=False,
                    help="Use raw-image training path instead of cached features (true/false)")
+    p.add_argument("--early-stop", type=parse_bool_arg, default=True,
+                   help="Enable MAE+loss early stopping (true/false)")
+    p.add_argument("--patience", type=int, default=3,
+                   help="Early stopping patience in epochs without validation improvement")
+    p.add_argument("--min-delta-avg", type=float, default=0.05,
+                   help="Minimum validation AVG improvement to reset patience")
+    p.add_argument("--min-delta-loss", type=float, default=1e-3,
+                   help="Minimum validation loss improvement to reset patience")
     args = p.parse_args()
 
     if args.raw and not args.university_release:
@@ -160,7 +186,7 @@ def main():
         torch.set_float32_matmul_precision("high")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_dtype = get_amp_dtype()
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_dtype == torch.float16)
+    scaler = make_grad_scaler(amp_dtype == torch.float16)
 
     c = PHASE_CFG[args.phase]
     ep = args.epochs or c["epochs"]
@@ -213,7 +239,10 @@ def main():
 
     mode_text = "raw-images" if args.raw else "cached-features"
     print(f"\nPhase {args.phase}: {ep} epochs, LR={lr}, BS={bs} | input={mode_text}")
-    best = float("inf")
+    best_avg = float("inf")
+    best_val_loss = float("inf")
+    best_epoch = 0
+    stale_epochs = 0
 
     for e in range(ep):
         for pg in optim.param_groups:
@@ -223,20 +252,53 @@ def main():
         vm = validate(model, dl_va, dev, amp_dtype, args.phase, args.raw)
         print(f"Epoch {e+1}/{ep} ({time.time()-t0:.0f}s)  "
               f"Train L={tm['loss']:.4f} |  "
+              f"Val L={vm['val_loss']:.4f} |  "
               f"Val MAE_H={vm['mae_heading']:.1f}°  "
               f"MAE_D={vm['mae_distance']:.1f}m  "
               f"AVG={vm['avg']:.2f}  SR@10={vm['sr10']:.1f}%")
 
-        if vm["avg"] < best:
-            best = vm["avg"]
+        prev_best_avg = best_avg
+        avg_improved = vm["avg"] < prev_best_avg - args.min_delta_avg
+        loss_improved = vm["val_loss"] < best_val_loss - args.min_delta_loss
+        mae_not_regressed = vm["avg"] <= prev_best_avg + args.min_delta_avg
+        progressed = avg_improved or (loss_improved and mae_not_regressed)
+
+        if progressed:
+            stale_epochs = 0
+            reasons: list[str] = []
+            if avg_improved:
+                best_avg = vm["avg"]
+                reasons.append("avg")
+            if loss_improved and mae_not_regressed:
+                best_val_loss = vm["val_loss"]
+                reasons.append("loss")
+            best_epoch = e + 1
             torch.save({
-                "phase": args.phase, "epoch": e, "val_avg": best,
+                "phase": args.phase,
+                "epoch": e,
+                "val_avg": vm["avg"],
+                "val_loss": vm["val_loss"],
+                "best_val_avg": best_avg,
+                "best_val_loss": best_val_loss,
                 "model_state_dict": model.state_dict(),
                 "optim_state_dict": optim.state_dict(),
             }, args.checkpoint)
-            print(f"  ★ Best checkpoint!")
+            reason_text = "+".join(reasons) if reasons else "stability"
+            print(f"  ★ Best checkpoint ({reason_text})")
+        else:
+            stale_epochs += 1
+            print(f"  No validation improvement for {stale_epochs}/{args.patience} epochs")
+            if args.early_stop and stale_epochs >= args.patience:
+                print(
+                    f"Early stopping at epoch {e+1}: "
+                    f"validation AVG/Loss did not improve (patience={args.patience})."
+                )
+                break
 
-    print(f"\nDone. Best AVG = {best:.2f}")
+    print(
+        f"\nDone. Best AVG = {best_avg:.2f} | "
+        f"Best ValLoss = {best_val_loss:.4f} | Best Epoch = {best_epoch}"
+    )
 
 
 if __name__ == "__main__":
