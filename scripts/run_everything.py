@@ -55,6 +55,45 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
+def resolve_data_root(value: str | None, *, description: str,
+                      env_names: tuple[str, ...],
+                      candidates: tuple[Path, ...]) -> Path:
+    if value:
+        explicit = Path(value).expanduser()
+        if explicit.is_dir():
+            return explicit.resolve()
+        raise FileNotFoundError(f"{description} does not exist: {explicit}")
+
+    checked: list[Path] = []
+    seen: set[str] = set()
+
+    for env_name in env_names:
+        env_value = os.environ.get(env_name)
+        if not env_value:
+            continue
+        candidate = Path(env_value).expanduser()
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(candidate)
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    for candidate in candidates:
+        candidate = candidate.expanduser()
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(candidate)
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    checked_text = ", ".join(str(path) for path in checked) if checked else "<none>"
+    raise FileNotFoundError(f"Could not determine {description}. Checked: {checked_text}")
+
+
 def format_command(command: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(command)
@@ -97,21 +136,17 @@ def run_command(command: list[str], cwd: Path, log_path: Path, stage_name: str,
 
 
 def validate_pairuav_root(pairuav_root: Path) -> tuple[int, int]:
-    test_dir = pairuav_root / "test"
-    test_tour_dir = pairuav_root / "test_tour"
-    if not test_dir.is_dir():
-        raise FileNotFoundError(f"Missing pairUAV test directory: {test_dir}")
-    if not test_tour_dir.is_dir():
-        raise FileNotFoundError(f"Missing pairUAV test_tour directory: {test_tour_dir}")
+    from scripts.generate_submission import _discover_pairs
 
-    json_files = sorted(test_dir.rglob("*.json"))
-    image_files = [path for path in test_tour_dir.rglob("*") if path.is_file()]
-    if not json_files:
-        raise FileNotFoundError(f"No JSON pair files found under {test_dir}")
-    if not image_files:
-        raise FileNotFoundError(f"No test images found under {test_tour_dir}")
+    pairs = _discover_pairs(pairuav_root)
+    if not pairs:
+        raise FileNotFoundError(
+            f"Could not discover any submission pairs under {pairuav_root}. "
+            "Expected a manifest file, test JSON pairs, or query/gallery split directories."
+        )
 
-    return len(json_files), len(image_files)
+    unique_images = {path for pair in pairs for path in pair}
+    return len(pairs), len(unique_images)
 
 
 def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path) -> None:
@@ -280,10 +315,10 @@ def package_submission(result_txt: Path, result_zip: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verbose end-to-end PairUAV runner")
-    parser.add_argument("--university-release", required=True,
-                        help="Path to the raw University-Release root")
-    parser.add_argument("--pairuav-root", required=True,
-                        help="Path to the processed PairUAV root containing test/ and test_tour/")
+    parser.add_argument("--university-release", default=None,
+                        help="Path to the raw University-Release root; auto-detected from the mounted AutoDL dataset when omitted")
+    parser.add_argument("--pairuav-root", default=None,
+                        help="Path to the PairUAV submission root; auto-detected from mounted AutoDL data when omitted")
     parser.add_argument("--mode", choices=["dual-path", "phase1-lite"], default="dual-path",
                         help="Training pipeline to run")
     parser.add_argument("--phases", default="1,2,3",
@@ -308,8 +343,26 @@ def main() -> None:
                         help="DataLoader workers to pass to training scripts")
     args = parser.parse_args()
 
-    raw_root = Path(args.university_release).expanduser().resolve()
-    pairuav_root = Path(args.pairuav_root).expanduser().resolve()
+    raw_root = resolve_data_root(
+        args.university_release,
+        description="University-Release root",
+        env_names=("PAIRUAV_UNIVERSITY_RELEASE", "UNIVERSITY_RELEASE_ROOT", "UNIVERSITY_RELEASE"),
+        candidates=(
+            Path("/root/autodl-tmp/university/University-Release/University-Release"),
+            Path("/root/autodl-tmp/university/University-Release"),
+        ),
+    )
+    pairuav_root = resolve_data_root(
+        args.pairuav_root,
+        description="PairUAV submission root",
+        env_names=("PAIRUAV_ROOT", "PAIRUAV_DATA_ROOT", "PAIRUAV_PROCESSED_ROOT"),
+        candidates=(
+            Path("/root/autodl-tmp/university/PairUAV"),
+            Path("/root/autodl-tmp/university/PairUAV-Processed"),
+            Path("/root/autodl-pub/PairUAV"),
+            raw_root,
+        ),
+    )
     run_root = Path(args.run_dir).expanduser().resolve() if args.run_dir else (REPO_ROOT / "runs" / now_stamp())
     run_root = ensure_dir(run_root)
     logs_dir = ensure_dir(run_root / "logs")

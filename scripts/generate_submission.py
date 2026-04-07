@@ -3,6 +3,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence
@@ -30,6 +31,46 @@ PAIR_MANIFEST_NAMES = (
     "test.csv",
     "annotations.csv",
 )
+
+DEFAULT_PAIRUAV_ROOT_CANDIDATES = (
+    Path("/root/autodl-tmp/university/PairUAV"),
+    Path("/root/autodl-tmp/university/PairUAV-Processed"),
+    Path("/root/autodl-pub/PairUAV"),
+    Path("/root/autodl-tmp/university/University-Release/University-Release"),
+)
+
+
+def resolve_pairuav_root(root: str | None) -> Path:
+    if root:
+        explicit = Path(root).expanduser()
+        if explicit.is_dir():
+            return explicit.resolve()
+        raise FileNotFoundError(f"PairUAV root does not exist: {explicit}")
+
+    candidates: list[Path] = []
+    for env_name in ("PAIRUAV_ROOT", "PAIRUAV_DATA_ROOT", "PAIRUAV_PROCESSED_ROOT"):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(Path(value).expanduser())
+
+    candidates.extend(DEFAULT_PAIRUAV_ROOT_CANDIDATES)
+
+    checked: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(candidate)
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        "Could not determine a usable PairUAV root. Checked: "
+        + ", ".join(str(path) for path in checked)
+        + ". Set --pairuav-root or the PAIRUAV_ROOT environment variable to the mounted data path."
+    )
 
 
 def _is_image_file(path: Path) -> bool:
@@ -321,10 +362,7 @@ def generate_submission(checkpoint: str, cache_dir: str | None = None,
                         output: str = "result.txt", split: str = "query"):
     """Generate result.txt for CodaBench submission."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    root = Path(pairuav_root) if pairuav_root else None
-
-    if root is None:
-        raise ValueError("A processed PairUAV root is required to generate submissions.")
+    root = resolve_pairuav_root(pairuav_root)
 
     model, model_kind = _load_model(checkpoint, device)
     pairs = _discover_pairs(root)
@@ -359,8 +397,8 @@ if __name__ == "__main__":
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--cache", type=str)
     p.add_argument("--pairuav-root", "--university-release", "--data", dest="pairuav_root",
-                   type=str, required=True,
-                   help="Path to the processed PairUAV root containing test/ and test_tour/")
+                   type=str, default=None,
+                   help="Path to the PairUAV data root used for submission discovery; when omitted the script auto-detects the mounted AutoDL dataset")
     p.add_argument("--output", type=str, default="result.txt")
     args = p.parse_args()
     generate_submission(args.checkpoint, args.cache, args.pairuav_root, args.output)
