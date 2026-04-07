@@ -388,7 +388,9 @@ def generate_submission(checkpoint: str, cache_dir: str | None = None,
             heading = heading.detach().cpu().tolist()
             distance = distance.detach().cpu().tolist()
             for angle, dist in zip(heading, distance):
-                handle.write(f"{float(angle):.6f} {float(dist):.6f}\n")
+                angle_value = ((float(angle) + 180.0) % 360.0) - 180.0
+                distance_value = max(0.0, float(dist))
+                handle.write(f"{angle_value:.6f} {distance_value:.6f}\n")
 
     print(f"Result written to {output_path}")
 

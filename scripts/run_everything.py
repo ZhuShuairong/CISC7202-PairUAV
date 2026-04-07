@@ -366,6 +366,9 @@ def main() -> None:
         candidates=(
             Path("/root/autodl-tmp/university/University-Release/University-Release"),
             Path("/root/autodl-tmp/university/University-Release"),
+            Path("/root/autodl-tmp/university/PairUAV"),
+            Path("/root/autodl-tmp/university/pairUAV"),
+            Path("/root/autodl-tmp/university/PairUAV-Processed"),
         ),
     )
     requested_pairuav_root = Path(args.pairuav_root).expanduser() if args.pairuav_root else None
@@ -503,6 +506,8 @@ def main() -> None:
                     train_cmd.extend([
                         "--raw", "true",
                         "--university-release", str(raw_root),
+                        "--annotations-root", str(pairuav_root),
+                        "--official-annotations", "auto",
                     ])
                 else:
                     train_cmd.extend(["--cache", str(cache_train_dir)])

@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.cache_features import CachedDataset
+from utils.metrics import comprehensive_metrics
 from models.harp_dual_path import HARPDualPath
 from training.loss import phase1_loss, phase2_loss, laplace_nll
 
@@ -126,27 +127,46 @@ def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scale
 def validate(model, loader, dev, amp_dtype, phase: int, use_raw: bool):
     model.eval()
     model.phase = 1 if phase == 1 else 2
-    e_h, e_d, sr, total = 0.0, 0.0, 0, 0
     v_loss, v_angle, n = 0.0, 0.0, 0
+    pred_heading_batches = []
+    pred_distance_batches = []
+    tgt_heading_batches = []
+    tgt_distance_batches = []
+
     for batch in loader:
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred, tgt = forward_batch(model, batch, dev, use_raw)
             losses = compute_phase_losses(pred, tgt, phase)
-        eh = (pred["heading"] - tgt["heading"]).abs()
-        eh = torch.where(eh > 180, 360 - eh, eh)
-        ed = (pred["distance"] - tgt["distance"]).abs()
-        ep_dist = torch.sqrt((pred["heading"] - tgt["heading"]).pow(2) * 0.01
-                             + (pred["distance"] - tgt["distance"]).pow(2))
-        sr += (ep_dist < 10).sum().item()
-        B = tgt["heading"].shape[0]
-        e_h += eh.sum().item(); e_d += ed.sum().item(); total += B
+
+        pred_heading_batches.append(pred["heading"].detach().cpu())
+        pred_distance_batches.append(pred["distance"].detach().cpu())
+        tgt_heading_batches.append(tgt["heading"].detach().cpu())
+        tgt_distance_batches.append(tgt["distance"].detach().cpu())
+
         v_loss += losses["total"].item()
         v_angle += losses.get("angle", torch.tensor(0.0)).item()
         n += 1
-    mae_h = e_h / total; mae_d = e_d / total
-    return {"mae_heading": mae_h, "mae_distance": mae_d,
-            "avg": (mae_h + mae_d) / 2, "sr10": sr / total * 100,
-            "val_loss": v_loss / max(n, 1), "val_angle_loss": v_angle / max(n, 1)}
+
+    pred_h = torch.cat(pred_heading_batches)
+    pred_d = torch.cat(pred_distance_batches)
+    tgt_h = torch.cat(tgt_heading_batches)
+    tgt_d = torch.cat(tgt_distance_batches)
+
+    metrics = comprehensive_metrics(
+        {"heading": pred_h, "distance": pred_d},
+        {"heading": tgt_h, "distance": tgt_d},
+    )
+    return {
+        "mae_heading": metrics["mae_heading"],
+        "mae_distance": metrics["mae_distance"],
+        "avg": metrics["avg"],
+        "angle_rel_error": metrics["angle_rel_error"],
+        "distance_rel_error": metrics["distance_rel_error"],
+        "final_score": metrics["final_score"],
+        "sr10": metrics["sr_10m"],
+        "val_loss": v_loss / max(n, 1),
+        "val_angle_loss": v_angle / max(n, 1),
+    }
 
 
 def main():
@@ -163,12 +183,19 @@ def main():
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--raw", type=parse_bool_arg, default=False,
                    help="Use raw-image training path instead of cached features (true/false)")
+    p.add_argument("--annotations-root", type=str, default=None,
+                   help="Optional PairUAV root containing official train annotations")
+    p.add_argument("--official-annotations", choices=["auto", "true", "false"],
+                   default="auto",
+                   help="Use official PairUAV train JSON labels in raw mode")
     p.add_argument("--early-stop", type=parse_bool_arg, default=True,
                    help="Enable MAE+loss early stopping (true/false)")
     p.add_argument("--patience", type=int, default=3,
                    help="Early stopping patience in epochs without validation improvement")
     p.add_argument("--min-delta-avg", type=float, default=0.05,
                    help="Minimum validation AVG improvement to reset patience")
+    p.add_argument("--min-delta-score", type=float, default=1e-3,
+                   help="Minimum final_score improvement to reset patience")
     p.add_argument("--min-delta-loss", type=float, default=1e-3,
                    help="Minimum validation loss improvement to reset patience")
     args = p.parse_args()
@@ -192,18 +219,104 @@ def main():
     ep = args.epochs or c["epochs"]
     bs = args.batch_size or c["bs"]
     lr = args.lr or c["lr"]
+    data_mode_text = "cached-features"
 
     if args.raw:
-        from data.dataset import PairDataset, resolve_train_view_dir
+        from data.dataset import (
+            PairDataset,
+            PairUAVAnnotationDataset,
+            collect_annotation_json_paths,
+            resolve_train_annotation_dir,
+            resolve_train_view_dir,
+        )
 
-        view_dir = resolve_train_view_dir(Path(args.university_release))
-        all_bld = sorted(path.name for path in view_dir.iterdir() if path.is_dir())
-        tr = all_bld[:560]
-        va = all_bld[560:]
-        ds_tr = PairDataset(args.university_release, buildings=tr,
-                            max_pairs=960_000, seed=args.seed, is_val=False)
-        ds_va = PairDataset(args.university_release, buildings=va,
-                            max_pairs=20_000, seed=args.seed+1, is_val=True)
+        annotation_root = Path(args.annotations_root).resolve() if args.annotations_root else Path(args.university_release)
+        annotation_dir = resolve_train_annotation_dir(annotation_root)
+        if args.official_annotations == "true" and annotation_dir is None:
+            raise FileNotFoundError(
+                "--official-annotations true was requested, but no train annotations were found under "
+                f"{annotation_root}"
+            )
+
+        use_official_annotations = (
+            annotation_dir is not None if args.official_annotations == "auto"
+            else args.official_annotations == "true"
+        )
+
+        if use_official_annotations:
+            assert annotation_dir is not None
+            group_dirs = [
+                path.name
+                for path in annotation_dir.iterdir()
+                if path.is_dir() and any(p.is_file() for p in path.glob("*.json"))
+            ]
+            group_dirs = sorted(
+                group_dirs,
+                key=lambda name: (int(name) if name.isdigit() else 10**12, name),
+            )
+
+            if len(group_dirs) >= 2:
+                split_idx = max(1, int(len(group_dirs) * 0.8))
+                split_idx = min(split_idx, len(group_dirs) - 1)
+                tr_groups = group_dirs[:split_idx]
+                va_groups = group_dirs[split_idx:]
+                ds_tr = PairUAVAnnotationDataset(
+                    str(annotation_root),
+                    groups=tr_groups,
+                    max_pairs=960_000,
+                    seed=args.seed,
+                    is_val=False,
+                )
+                ds_va = PairUAVAnnotationDataset(
+                    str(annotation_root),
+                    groups=va_groups,
+                    max_pairs=20_000,
+                    seed=args.seed + 1,
+                    is_val=True,
+                )
+            else:
+                all_json = collect_annotation_json_paths(annotation_dir)
+                if len(all_json) < 2:
+                    raise RuntimeError(
+                        "Official annotation mode requires at least 2 JSON files for train/val split."
+                    )
+                split_idx = max(1, int(len(all_json) * 0.8))
+                split_idx = min(split_idx, len(all_json) - 1)
+                tr_json = all_json[:split_idx]
+                va_json = all_json[split_idx:]
+                ds_tr = PairUAVAnnotationDataset(
+                    str(annotation_root),
+                    json_paths=tr_json,
+                    max_pairs=960_000,
+                    seed=args.seed,
+                    is_val=False,
+                )
+                ds_va = PairUAVAnnotationDataset(
+                    str(annotation_root),
+                    json_paths=va_json,
+                    max_pairs=20_000,
+                    seed=args.seed + 1,
+                    is_val=True,
+                )
+
+            data_mode_text = "official-annotations"
+            print(f"Using official annotation supervision from {annotation_dir}")
+        else:
+            view_dir = resolve_train_view_dir(Path(args.university_release))
+            all_bld = sorted(path.name for path in view_dir.iterdir() if path.is_dir())
+            if len(all_bld) < 2:
+                raise RuntimeError(
+                    f"Need at least 2 building folders for pseudo-pair split, found {len(all_bld)} in {view_dir}"
+                )
+            split_idx = max(1, int(len(all_bld) * 0.8))
+            split_idx = min(split_idx, len(all_bld) - 1)
+            tr = all_bld[:split_idx]
+            va = all_bld[split_idx:]
+            ds_tr = PairDataset(args.university_release, buildings=tr,
+                                max_pairs=960_000, seed=args.seed, is_val=False)
+            ds_va = PairDataset(args.university_release, buildings=va,
+                                max_pairs=20_000, seed=args.seed+1, is_val=True)
+            data_mode_text = "pseudo-pairs"
     else:
         all_bld = sorted(f.stem for f in Path(args.cache).glob("*.npz"))
         tr = all_bld[:560]
@@ -237,9 +350,10 @@ def main():
         [p for p in model.parameters() if p.requires_grad],
         lr=lr, weight_decay=0.01)
 
-    mode_text = "raw-images" if args.raw else "cached-features"
+    mode_text = data_mode_text if args.raw else "cached-features"
     print(f"\nPhase {args.phase}: {ep} epochs, LR={lr}, BS={bs} | input={mode_text}")
     best_avg = float("inf")
+    best_final_score = float("inf")
     best_val_loss = float("inf")
     best_epoch = 0
     stale_epochs = 0
@@ -255,13 +369,19 @@ def main():
               f"Val L={vm['val_loss']:.4f} |  "
               f"Val MAE_H={vm['mae_heading']:.1f}°  "
               f"MAE_D={vm['mae_distance']:.1f}m  "
-              f"AVG={vm['avg']:.2f}  SR@10={vm['sr10']:.1f}%")
+              f"AVG={vm['avg']:.2f}  "
+              f"Final={vm['final_score']:.4f}  "
+              f"AngRel={vm['angle_rel_error']:.4f}  "
+              f"DistRel={vm['distance_rel_error']:.4f}  "
+              f"SR@10={vm['sr10']:.1f}%")
 
         prev_best_avg = best_avg
+        prev_best_final = best_final_score
         avg_improved = vm["avg"] < prev_best_avg - args.min_delta_avg
+        score_improved = vm["final_score"] < prev_best_final - args.min_delta_score
         loss_improved = vm["val_loss"] < best_val_loss - args.min_delta_loss
-        mae_not_regressed = vm["avg"] <= prev_best_avg + args.min_delta_avg
-        progressed = avg_improved or (loss_improved and mae_not_regressed)
+        score_not_regressed = vm["final_score"] <= prev_best_final + args.min_delta_score
+        progressed = score_improved or (avg_improved and score_not_regressed) or (loss_improved and score_not_regressed)
 
         if progressed:
             stale_epochs = 0
@@ -269,7 +389,10 @@ def main():
             if avg_improved:
                 best_avg = vm["avg"]
                 reasons.append("avg")
-            if loss_improved and mae_not_regressed:
+            if score_improved:
+                best_final_score = vm["final_score"]
+                reasons.append("score")
+            if loss_improved and score_not_regressed:
                 best_val_loss = vm["val_loss"]
                 reasons.append("loss")
             best_epoch = e + 1
@@ -277,8 +400,10 @@ def main():
                 "phase": args.phase,
                 "epoch": e,
                 "val_avg": vm["avg"],
+                "val_final_score": vm["final_score"],
                 "val_loss": vm["val_loss"],
                 "best_val_avg": best_avg,
+                "best_val_final_score": best_final_score,
                 "best_val_loss": best_val_loss,
                 "model_state_dict": model.state_dict(),
                 "optim_state_dict": optim.state_dict(),
@@ -291,12 +416,13 @@ def main():
             if args.early_stop and stale_epochs >= args.patience:
                 print(
                     f"Early stopping at epoch {e+1}: "
-                    f"validation AVG/Loss did not improve (patience={args.patience})."
+                    f"validation score/AVG/loss did not improve (patience={args.patience})."
                 )
                 break
 
     print(
-        f"\nDone. Best AVG = {best_avg:.2f} | "
+        f"\nDone. Best FinalScore = {best_final_score:.4f} | "
+        f"Best AVG = {best_avg:.2f} | "
         f"Best ValLoss = {best_val_loss:.4f} | Best Epoch = {best_epoch}"
     )
 

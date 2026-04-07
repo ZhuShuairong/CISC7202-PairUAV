@@ -196,7 +196,7 @@ class HARPDualPath(nn.Module):
             delta, conf_mod = self.gate(wide_out)
             return {
                 'heading': wide_out['heading'] + delta[:, 0],
-                'distance': wide_out['distance'] + delta[:, 1],
+                'distance': (wide_out['distance'] + delta[:, 1]).clamp(min=0.0),
                 'confidence': wide_out['confidence'] * conf_mod,
                 'wide_heading': wide_out['heading'],
                 'wide_distance': wide_out['distance'],
