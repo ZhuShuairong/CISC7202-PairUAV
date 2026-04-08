@@ -705,6 +705,8 @@ def main() -> None:
         "--checkpoint", str(checkpoint_path),
         "--cache", str(cache_infer_dir),
         "--pairuav-root", str(pairuav_root),
+        "--pair-order", "official",
+        "--safe-submission-mode",
         "--output", str(result_txt),
     ]
     run_command(infer_cmd, REPO_ROOT, infer_log, "inference")

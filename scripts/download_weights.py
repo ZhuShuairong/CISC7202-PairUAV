@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """download_weights.py — Pre-download all model weights for fast GPU deployment.
 
-This script downloads DINOv2-ResNet50 weights from timm/torchvision
-and saves them locally so they're ready when training starts on a GPU machine.
+This script prioritizes China-accessible download paths (HF endpoint via env/
+defaults) and keeps western hub access opt-in.
 
 Usage:
     python scripts/download_weights.py --out checkpoints/
+    python scripts/download_weights.py --out checkpoints/ --allow-western-hub
 """
 
 import argparse
@@ -34,6 +35,11 @@ def main():
     parser = argparse.ArgumentParser(description='Pre-download model weights')
     parser.add_argument('--out', type=str, default='checkpoints/',
                        help='Output directory for weights')
+    parser.add_argument(
+        '--allow-western-hub',
+        action='store_true',
+        help='Allow torch.hub GitHub downloads (disabled by default for China-hosted environments)',
+    )
     args = parser.parse_args()
     hf_endpoint = resolve_hf_endpoint()
 
@@ -61,17 +67,21 @@ def main():
     
     # 2. DINOv2 ViT-B/14 (alternative backbone)
     print("\n[2/3] Checking DINOv2 availability...")
-    try:
-        import torch
-        # Try torch.hub for DINOv2
-        dinov2_vitb14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
-        dinov2_vitb14.eval()
-        save_path = os.path.join(args.out, 'dinov2_vitb14.pth')
-        torch.save(dinov2_vitb14.state_dict(), save_path)
-        size_mb = os.path.getsize(save_path) / 1e6
-        print(f"  ✓ Saved to {save_path} ({size_mb:.1f} MB)")
-    except Exception as e:
-        print(f"  ✗ Failed (will download at training time): {e}")
+    if args.allow_western_hub:
+        try:
+            import torch
+            # torch.hub points to GitHub; keep it explicit opt-in for restricted networks.
+            dinov2_vitb14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14')
+            dinov2_vitb14.eval()
+            save_path = os.path.join(args.out, 'dinov2_vitb14.pth')
+            torch.save(dinov2_vitb14.state_dict(), save_path)
+            size_mb = os.path.getsize(save_path) / 1e6
+            print(f"  ✓ Saved to {save_path} ({size_mb:.1f} MB)")
+        except Exception as e:
+            print(f"  ✗ Failed (will download at training time): {e}")
+    else:
+        print("  ! Skipped by default to avoid GitHub/Western hub access.")
+        print("    Use --allow-western-hub to enable this optional step.")
     
     # 3. timm ResNet50.a1_in1k (DINO-pretrained variant)
     print("\n[3/3] Checking DINO-pretrained ResNet50 via timm...")

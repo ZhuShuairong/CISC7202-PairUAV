@@ -64,7 +64,7 @@ class BaselineHead(nn.Module):
     
     def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
+        self.hidden = nn.Sequential(
             nn.Linear(8192, 4096),
             nn.BatchNorm1d(4096),
             nn.ReLU(inplace=True),
@@ -73,11 +73,15 @@ class BaselineHead(nn.Module):
             nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
-            nn.Linear(1024, 2),  # [angle, distance]
         )
+        # Explicit final regression layer avoids accidental hidden-state misuse.
+        self.out = nn.Linear(1024, 2)  # [angle, distance]
     
     def forward(self, x: torch.Tensor) -> dict:
-        raw = self.net(x)  # (B, 2)
+        hidden = self.hidden(x)
+        raw = self.out(hidden)  # (B, 2)
+        if raw.ndim != 2 or raw.size(1) != 2:
+            raise RuntimeError(f"BaselineHead must output shape (B, 2), got {tuple(raw.shape)}")
         heading_deg = raw[:, 0]  # unbounded (angle in degrees)
         distance = torch.clamp(raw[:, 1], min=0.0)  # distance ≥ 0
         return {'heading_deg': heading_deg, 'distance': distance}

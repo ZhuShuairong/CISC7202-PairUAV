@@ -1,0 +1,112 @@
+{
+  "name": "GeoPairNet-PairUAV-Default",
+  "description": "Dual-head geometry-aware baseline tuned for PairUAV/UAVM 2026",
+  "model": {
+    "backbone_name": "auto",
+    "pretrained": true,
+    "dino_weights_path": "checkpoints/dino_resnet50.pth",
+    "global_dim": 1024,
+    "spatial_dim": 128,
+    "fused_dim": 1024,
+    "rotation_hidden_dim": 384,
+    "distance_hidden_dim": 384,
+    "distance_bins": 24,
+    "log_distance_min": 0.0,
+    "log_distance_max": 5.2,
+    "match_feature_dim": 8,
+    "geometry_feature_dim": 6,
+    "dropout": 0.1,
+    "use_uncertainty": true,
+    "no_match_features": false,
+    "no_geometry_features": false,
+    "no_distance_bins": false
+  },
+  "dataset": {
+    "mode": "official",
+    "strict_official_only": true,
+    "allow_pseudo_warmup_only": false,
+    "val_ratio": 0.1,
+    "image_size": 224,
+    "max_train_pairs": 960000,
+    "max_val_pairs": 20000,
+    "match_root": null,
+    "match_index_file": null,
+    "match_missing_policy": "disable",
+    "num_workers": 12,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "prefetch_factor": 4
+  },
+  "loss": {
+    "distance_bins": 24,
+    "log_distance_min": 0.0,
+    "log_distance_max": 5.2,
+    "min_distance": 1.0,
+    "smooth_l1_beta": 0.05,
+    "distance_cls_weight": 0.35
+  },
+  "optimizer": {
+    "betas": [0.9, 0.999],
+    "weight_decay": 0.0001
+  },
+  "training": {
+    "seed": 42,
+    "deterministic": true,
+    "amp": true,
+    "channels_last": true,
+    "grad_accum_steps": 1,
+    "max_grad_norm": 1.0,
+    "use_ema": true,
+    "ema_decay": 0.999,
+    "safe_submission_mode": false,
+    "safe_baseline_mode": false,
+    "validation_debug_samples": 0,
+    "validation_debug_every_epoch": false,
+    "cache_equivalence_check": true,
+    "cache_equivalence_tolerance": 0.0001,
+    "file_metric_parity_check": true,
+    "file_metric_parity_tolerance": 0.000001
+  },
+  "stages": [
+    {
+      "name": "A",
+      "epochs": 4,
+      "batch_size": 128,
+      "lr": 0.0008,
+      "min_lr": 0.00002,
+      "warmup_epochs": 1,
+      "backbone_mode": "frozen",
+      "train_projectors": false,
+      "disable_augmentation": true,
+      "feature_cache": true,
+      "feature_cache_size": 80000,
+      "early_stop_patience": 3
+    },
+    {
+      "name": "B",
+      "epochs": 10,
+      "batch_size": 96,
+      "lr": 0.00025,
+      "min_lr": 0.000005,
+      "warmup_epochs": 1,
+      "backbone_mode": "upper",
+      "train_projectors": true,
+      "disable_augmentation": false,
+      "feature_cache": false,
+      "early_stop_patience": 4
+    },
+    {
+      "name": "C",
+      "epochs": 6,
+      "batch_size": 64,
+      "lr": 0.00008,
+      "min_lr": 0.000001,
+      "warmup_epochs": 1,
+      "backbone_mode": "full",
+      "train_projectors": true,
+      "disable_augmentation": false,
+      "feature_cache": false,
+      "early_stop_patience": 3
+    }
+  ]
+}
