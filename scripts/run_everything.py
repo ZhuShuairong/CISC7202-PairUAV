@@ -438,6 +438,56 @@ def has_prepared_pairuav_layout(root: Path) -> bool:
     return has_train_view and has_train_annotations and has_test_annotations and has_test_tour
 
 
+def resolve_superglue_root(explicit: str | None, pairuav_root: Path) -> Path:
+    checked: list[Path] = []
+    seen: set[str] = set()
+    candidates: list[Path] = []
+
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+
+    candidates.extend([
+        REPO_ROOT / "baseline" / "SuperGlue",
+        REPO_ROOT.parent / "baseline" / "SuperGlue",
+        pairuav_root / "baseline" / "SuperGlue",
+    ])
+
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(candidate)
+        if candidate.is_dir():
+            return candidate.resolve()
+
+    checked_text = ", ".join(str(path) for path in checked) if checked else "<none>"
+    raise FileNotFoundError(
+        "Could not locate SuperGlue workspace. Checked: "
+        f"{checked_text}. Provide --superglue-root to baseline/SuperGlue."
+    )
+
+
+def find_match_dir(split_tag: str, pairuav_root: Path, superglue_root: Path) -> Path | None:
+    candidates = [
+        pairuav_root / f"{split_tag}_matches_data",
+        pairuav_root / "matches" / f"{split_tag}_matches_data",
+        superglue_root / f"{split_tag}_matches_data",
+        superglue_root.parent / f"{split_tag}_matches_data",
+        superglue_root.parent.parent / f"{split_tag}_matches_data",
+    ]
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_dir():
+            return candidate.resolve()
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verbose end-to-end PairUAV runner")
     parser.add_argument("--train-root", "--university-release", "--data", dest="train_root", default=None,
@@ -446,6 +496,8 @@ def main() -> None:
                         help="Path to the PairUAV submission root; auto-detected from mounted AutoDL data when omitted")
     parser.add_argument("--prepare-data", type=parse_bool_arg, default=True,
                         help="Run official PairUAV data preparation stage before training (true/false)")
+    parser.add_argument("--force-data-prep", action="store_true",
+                        help="Force rerunning official data prep even when processed layout already exists")
     parser.add_argument("--prepare-workdir", default=None,
                         help="Work directory for official data prep (defaults to --pairuav-root or /root/autodl-tmp/university/PairUAV)")
     parser.add_argument("--university-zip", default=None,
@@ -461,6 +513,12 @@ def main() -> None:
                         help="Skip Hugging Face download in official data prep")
     parser.add_argument("--skip-prep-extract", action="store_true",
                         help="Skip tar extraction in official data prep")
+    parser.add_argument("--prepare-matches", type=parse_bool_arg, default=False,
+                        help="Run SuperGlue match-data preparation stage (true/false)")
+    parser.add_argument("--superglue-root", default=None,
+                        help="Path to baseline/SuperGlue workspace used for match preparation")
+    parser.add_argument("--superglue-mode", choices=["download", "run"], default="download",
+                        help="SuperGlue stage mode: download precomputed matches or run matching scripts")
     parser.add_argument("--mode", choices=["dual-path", "phase1-lite"], default="dual-path",
                         help="Training pipeline to run")
     parser.add_argument("--phases", default="1,2,3",
@@ -524,8 +582,17 @@ def main() -> None:
 
         ensure_dir(prep_workdir)
 
-        if has_prepared_pairuav_layout(prep_workdir) and not args.skip_prep_download and not args.skip_prep_extract:
-            print(f"Official prep detected existing processed layout at {prep_workdir}; skipping data-prep stage.")
+        if (
+            has_prepared_pairuav_layout(prep_workdir)
+            and not args.force_data_prep
+            and not args.skip_prep_download
+            and not args.skip_prep_extract
+        ):
+            print(
+                "Official prep detected existing processed layout at "
+                f"{prep_workdir}; skipping data-prep stage. "
+                "Use --force-data-prep to rerun prep."
+            )
         else:
             prep_log = logs_dir / "00_data_prep.log"
             prep_cmd = [
@@ -625,6 +692,67 @@ def main() -> None:
     summary["pairuav_root"] = str(pairuav_root)
     if annotation_supervision_root is not None:
         summary["annotation_supervision_root"] = str(annotation_supervision_root)
+
+    if args.prepare_matches:
+        superglue_root = resolve_superglue_root(args.superglue_root, pairuav_root)
+        summary["superglue_root"] = str(superglue_root)
+        superglue_env = {
+            "PAIRUAV_ROOT": str(pairuav_root),
+            "PAIRUAV_DATA_ROOT": str(pairuav_root),
+        }
+
+        if args.superglue_mode == "download":
+            download_script = superglue_root / "download_results.sh"
+            if not download_script.is_file():
+                raise FileNotFoundError(
+                    f"SuperGlue download script not found: {download_script}"
+                )
+
+            match_log = logs_dir / f"{len(summary['stages']):02d}_superglue_download.log"
+            run_command(
+                ["bash", str(download_script)],
+                superglue_root,
+                match_log,
+                "superglue-download",
+                env=superglue_env,
+            )
+            summary["stages"].append({
+                "name": "superglue_download",
+                "status": "passed",
+                "log": str(match_log),
+            })
+        else:
+            required = [
+                ("gen_test_pairs.py", [sys.executable, "-u", str(superglue_root / "gen_test_pairs.py")], "superglue-gen-pairs"),
+                ("run_train.sh", ["bash", str(superglue_root / "run_train.sh")], "superglue-run-train"),
+                ("run_test.sh", ["bash", str(superglue_root / "run_test.sh")], "superglue-run-test"),
+            ]
+
+            for script_name, command, stage_name in required:
+                script_path = superglue_root / script_name
+                if not script_path.is_file():
+                    raise FileNotFoundError(f"SuperGlue script not found: {script_path}")
+
+                stage_log = logs_dir / f"{len(summary['stages']):02d}_{stage_name}.log"
+                run_command(command, superglue_root, stage_log, stage_name, env=superglue_env)
+                summary["stages"].append({
+                    "name": stage_name.replace("-", "_"),
+                    "status": "passed",
+                    "log": str(stage_log),
+                })
+
+        train_match_root = find_match_dir("train", pairuav_root, superglue_root)
+        test_match_root = find_match_dir("test", pairuav_root, superglue_root)
+        if train_match_root is None or test_match_root is None:
+            raise FileNotFoundError(
+                "SuperGlue stage finished, but match directories were not discovered. "
+                "Expected train_matches_data/ and test_matches_data/ under PairUAV or SuperGlue workspace."
+            )
+
+        print(f"Detected train match root: {train_match_root}")
+        print(f"Detected test match root: {test_match_root}")
+        summary["train_match_root"] = str(train_match_root)
+        summary["test_match_root"] = str(test_match_root)
 
     print(f"Run directory: {run_root}")
     print(f"Mode: {args.mode}")
