@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Prepare PairUAV data using the official UAVM baseline workflow.
+"""Prepare PairUAV data from the official leaderboard Hugging Face dataset.
 
-Official flow parity:
-1) unzip University-Release.zip
-2) copy University-Release/train/drone/* -> train_tour/
-3) remove University-Release and University-Release.zip
-4) download YaxuanLi/UAVM_2026_test dataset archives
-5) extract train.tar, test.tar, test_tour.tar
-6) remove tar files and .cache
+HF-only flow:
+1) download YaxuanLi/UAVM_2026_test dataset archives
+2) extract train.tar, test.tar, test_tour.tar
+3) optionally remove tar files and .cache
 
 Example:
     python scripts/prepare_pairuav_data.py --workdir /root/autodl-tmp/university/PairUAV
@@ -21,7 +18,6 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import zipfile
 from pathlib import Path
 
 DEFAULT_DATASET_REPO = "YaxuanLi/UAVM_2026_test"
@@ -31,82 +27,6 @@ REQUIRED_ARCHIVES = ("train.tar", "test.tar", "test_tour.tar")
 
 def emit(message: str) -> None:
     print(message, flush=True)
-
-
-def resolve_university_root_from_path(base_path: Path) -> Path | None:
-    candidates = [
-        base_path,
-        base_path / "University-Release",
-        base_path / "University-Release" / "University-Release",
-    ]
-    for root in candidates:
-        if (root / "train" / "drone").is_dir():
-            return root
-    return None
-
-
-def resolve_university_root(workdir: Path) -> Path | None:
-    return resolve_university_root_from_path(workdir)
-
-
-def maybe_unzip_university_release(workdir: Path,
-                                   university_zip: Path,
-                                   external_university_root: Path | None = None) -> Path:
-    if external_university_root is not None:
-        resolved_external = resolve_university_root_from_path(external_university_root)
-        if resolved_external is None:
-            raise FileNotFoundError(
-                "--university-release-root was provided, but train/drone was not found under "
-                f"{external_university_root}."
-            )
-        emit(f"[prep] Using existing University-Release root {resolved_external}")
-        return resolved_external.resolve()
-
-    root = resolve_university_root(workdir)
-    if root is not None:
-        emit(f"[prep] Found University-Release at {root}")
-        return root
-
-    if not university_zip.is_file():
-        raise FileNotFoundError(
-            "University-Release not found and zip is missing. "
-            f"Expected extracted folder under {workdir} or zip file {university_zip}."
-        )
-
-    emit(f"[prep] Extracting {university_zip} ...")
-    with zipfile.ZipFile(university_zip, "r") as archive:
-        archive.extractall(workdir)
-
-    root = resolve_university_root(workdir)
-    if root is None:
-        raise FileNotFoundError(
-            "Unable to locate University-Release/train/drone after unzip. "
-            "Please verify the archive structure."
-        )
-
-    emit(f"[prep] Extracted University-Release to {root}")
-    return root
-
-
-def copy_train_tour(university_root: Path, workdir: Path) -> int:
-    drone_root = university_root / "train" / "drone"
-    if not drone_root.is_dir():
-        raise FileNotFoundError(f"Missing expected training drone folder: {drone_root}")
-
-    train_tour = workdir / "train_tour"
-    train_tour.mkdir(parents=True, exist_ok=True)
-
-    copied_items = 0
-    for item in sorted(drone_root.iterdir(), key=lambda path: path.name.lower()):
-        target = train_tour / item.name
-        if item.is_dir():
-            shutil.copytree(item, target, dirs_exist_ok=True)
-        else:
-            shutil.copy2(item, target)
-        copied_items += 1
-
-    emit(f"[prep] Copied {copied_items} entries from {drone_root} -> {train_tour}")
-    return copied_items
 
 
 def _run_download_command(command: list[str], workdir: Path, token: str | None,
@@ -232,28 +152,9 @@ def extract_archives(workdir: Path) -> None:
 
 def cleanup(
     workdir: Path,
-    university_zip: Path,
-    keep_university_release: bool,
-    keep_university_zip: bool,
     keep_archives: bool,
     keep_cache: bool,
 ) -> None:
-    if not keep_university_release:
-        extracted_dir = workdir / "University-Release"
-        if extracted_dir.exists():
-            emit(f"[prep] Removing {extracted_dir}")
-            shutil.rmtree(extracted_dir)
-
-    if not keep_university_zip and university_zip.exists():
-        if university_zip.is_relative_to(workdir):
-            emit(f"[prep] Removing {university_zip}")
-            university_zip.unlink()
-        else:
-            emit(
-                "[prep] Skipping zip cleanup because it is outside workdir: "
-                f"{university_zip}"
-            )
-
     if not keep_archives:
         for path in archive_paths(workdir):
             if path.exists():
@@ -268,24 +169,12 @@ def cleanup(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Prepare PairUAV data with official baseline workflow")
+    parser = argparse.ArgumentParser(description="Prepare PairUAV data from official HF leaderboard archives")
     parser.add_argument(
         "--workdir",
         type=Path,
         default=Path.cwd(),
-        help="Directory where data is prepared (contains University-Release.zip and output folders)",
-    )
-    parser.add_argument(
-        "--university-zip",
-        type=Path,
-        default=None,
-        help="Path to University-Release.zip (defaults to <workdir>/University-Release.zip)",
-    )
-    parser.add_argument(
-        "--university-release-root",
-        type=Path,
-        default=None,
-        help="Path to an existing extracted University-Release root to copy from",
+        help="Directory where data is prepared (contains output train/test/test_tour folders)",
     )
     parser.add_argument(
         "--dataset-repo",
@@ -322,16 +211,6 @@ def parse_args() -> argparse.Namespace:
         help="Skip tar extraction step",
     )
     parser.add_argument(
-        "--keep-university-release",
-        action="store_true",
-        help="Keep extracted University-Release folder instead of deleting it",
-    )
-    parser.add_argument(
-        "--keep-university-zip",
-        action="store_true",
-        help="Keep University-Release.zip instead of deleting it",
-    )
-    parser.add_argument(
         "--keep-archives",
         action="store_true",
         help="Keep train.tar/test.tar/test_tour.tar after extraction",
@@ -349,31 +228,13 @@ def main() -> None:
     workdir = args.workdir.expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
-    external_university_root = None
-    if args.university_release_root is not None:
-        external_university_root = args.university_release_root.expanduser().resolve()
-
-    if args.university_zip:
-        university_zip = args.university_zip.expanduser()
-        if not university_zip.is_absolute():
-            university_zip = workdir / university_zip
-        university_zip = university_zip.resolve()
-    else:
-        university_zip = workdir / "University-Release.zip"
     token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     hf_endpoint = args.hf_endpoint or os.environ.get("HF_ENDPOINT") or DEFAULT_HF_ENDPOINT
     os.environ["HF_ENDPOINT"] = hf_endpoint
 
-    emit("[prep] PairUAV official-style preparation started")
+    emit("[prep] PairUAV HF-only preparation started")
     emit(f"[prep] Workdir: {workdir}")
     emit(f"[prep] HF endpoint: {hf_endpoint}")
-
-    university_root = maybe_unzip_university_release(
-        workdir,
-        university_zip,
-        external_university_root=external_university_root,
-    )
-    copy_train_tour(university_root, workdir)
 
     if args.skip_download:
         emit("[prep] Skip download enabled")
@@ -392,9 +253,6 @@ def main() -> None:
 
     cleanup(
         workdir,
-        university_zip,
-        keep_university_release=args.keep_university_release,
-        keep_university_zip=args.keep_university_zip,
         keep_archives=args.keep_archives,
         keep_cache=args.keep_cache,
     )
@@ -402,7 +260,7 @@ def main() -> None:
     emit("[prep] Done")
     emit(
         "[prep] Created/updated folders: "
-        f"{workdir / 'train_tour'}, {workdir / 'train'}, {workdir / 'test'}, {workdir / 'test_tour'}"
+        f"{workdir / 'train'}, {workdir / 'test'}, {workdir / 'test_tour'}"
     )
 
 

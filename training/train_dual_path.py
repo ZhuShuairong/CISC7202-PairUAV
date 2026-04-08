@@ -172,9 +172,9 @@ def validate(model, loader, dev, amp_dtype, phase: int, use_raw: bool):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--cache", type=str, default=None)
-    p.add_argument("--university-release", "--data", dest="university_release",
+    p.add_argument("--data-root", "--university-release", "--data", dest="data_root",
                    type=str, default=None,
-                   help="Path to University-Release root (required when --raw true)")
+                   help="Path to PairUAV training root (required when --raw true)")
     p.add_argument("--phase", type=int, choices=[1,2,3])
     p.add_argument("--epochs", type=int); p.add_argument("--batch-size", type=int)
     p.add_argument("--lr", type=float)
@@ -200,8 +200,8 @@ def main():
                    help="Minimum validation loss improvement to reset patience")
     args = p.parse_args()
 
-    if args.raw and not args.university_release:
-        raise ValueError("--university-release is required when --raw true")
+    if args.raw and not args.data_root:
+        raise ValueError("--data-root is required when --raw true")
     if not args.raw and not args.cache:
         raise ValueError("--cache is required when --raw false")
 
@@ -230,7 +230,7 @@ def main():
             resolve_train_view_dir,
         )
 
-        annotation_root = Path(args.annotations_root).resolve() if args.annotations_root else Path(args.university_release)
+        annotation_root = Path(args.annotations_root).resolve() if args.annotations_root else Path(args.data_root)
         annotation_dir = resolve_train_annotation_dir(annotation_root)
         if args.official_annotations == "true" and annotation_dir is None:
             raise FileNotFoundError(
@@ -302,7 +302,7 @@ def main():
             data_mode_text = "official-annotations"
             print(f"Using official annotation supervision from {annotation_dir}")
         else:
-            view_dir = resolve_train_view_dir(Path(args.university_release))
+            view_dir = resolve_train_view_dir(Path(args.data_root))
             all_bld = sorted(path.name for path in view_dir.iterdir() if path.is_dir())
             if len(all_bld) < 2:
                 raise RuntimeError(
@@ -312,9 +312,9 @@ def main():
             split_idx = min(split_idx, len(all_bld) - 1)
             tr = all_bld[:split_idx]
             va = all_bld[split_idx:]
-            ds_tr = PairDataset(args.university_release, buildings=tr,
+            ds_tr = PairDataset(args.data_root, buildings=tr,
                                 max_pairs=960_000, seed=args.seed, is_val=False)
-            ds_va = PairDataset(args.university_release, buildings=va,
+            ds_va = PairDataset(args.data_root, buildings=va,
                                 max_pairs=20_000, seed=args.seed+1, is_val=True)
             data_mode_text = "pseudo-pairs"
     else:

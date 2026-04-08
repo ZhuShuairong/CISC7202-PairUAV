@@ -184,7 +184,7 @@ def has_annotation_json(directory: Path) -> bool:
 
 def has_training_images(root: Path) -> bool:
     image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    candidate_dirs = [root / "train_tour", root / "train" / "drone"]
+    candidate_dirs = [root / "train_tour", root / "train" / "drone", root / "train"]
     for candidate in candidate_dirs:
         if not candidate.is_dir():
             continue
@@ -393,8 +393,8 @@ def has_prepared_pairuav_layout(root: Path) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Verbose end-to-end PairUAV runner")
-    parser.add_argument("--university-release", default=None,
-                        help="Path to the raw University-Release root; auto-detected from the mounted AutoDL dataset when omitted")
+    parser.add_argument("--train-root", "--university-release", "--data", dest="train_root", default=None,
+                        help="Path to PairUAV training root (processed HF layout preferred); legacy aliases are kept for compatibility")
     parser.add_argument("--pairuav-root", default=None,
                         help="Path to the PairUAV submission root; auto-detected from mounted AutoDL data when omitted")
     parser.add_argument("--prepare-data", type=parse_bool_arg, default=True,
@@ -402,7 +402,7 @@ def main() -> None:
     parser.add_argument("--prepare-workdir", default=None,
                         help="Work directory for official data prep (defaults to --pairuav-root or /root/autodl-tmp/university/PairUAV)")
     parser.add_argument("--university-zip", default=None,
-                        help="Path to University-Release.zip used by official data prep when needed")
+                        help="Deprecated no-op in HF-only prep mode")
     parser.add_argument("--prep-download-tool", choices=["auto", "hf", "huggingface-cli", "python"],
                         default="auto",
                         help="Download backend for official data prep")
@@ -461,12 +461,15 @@ def main() -> None:
     }
 
     requested_pairuav_root = Path(args.pairuav_root).expanduser() if args.pairuav_root else None
+    requested_train_root = Path(args.train_root).expanduser() if args.train_root else None
 
     if args.prepare_data:
         if args.prepare_workdir:
             prep_workdir = Path(args.prepare_workdir).expanduser().resolve()
         elif requested_pairuav_root is not None:
             prep_workdir = requested_pairuav_root.resolve()
+        elif requested_train_root is not None:
+            prep_workdir = requested_train_root.resolve()
         else:
             prep_workdir = Path(
                 os.environ.get("PAIRUAV_ROOT", "/root/autodl-tmp/university/PairUAV")
@@ -489,16 +492,15 @@ def main() -> None:
                 "--dataset-repo",
                 args.prep_dataset_repo,
             ]
-            if args.university_zip:
-                prep_cmd.extend(["--university-zip", str(Path(args.university_zip).expanduser())])
-            if args.university_release:
-                prep_cmd.extend(["--university-release-root", str(Path(args.university_release).expanduser())])
             if args.hf_token:
                 prep_cmd.extend(["--hf-token", args.hf_token])
             if args.skip_prep_download:
                 prep_cmd.append("--skip-download")
             if args.skip_prep_extract:
                 prep_cmd.append("--skip-extract")
+
+            if args.university_zip:
+                print("Note: --university-zip is ignored in HF-only prep mode.")
 
             run_command(prep_cmd, REPO_ROOT, prep_log, "data-prep")
             summary["stages"].append({
@@ -512,15 +514,23 @@ def main() -> None:
         pairuav_root = prep_workdir
     else:
         raw_root = resolve_data_root(
-            args.university_release,
-            description="University-Release root",
-            env_names=("PAIRUAV_UNIVERSITY_RELEASE", "UNIVERSITY_RELEASE_ROOT", "UNIVERSITY_RELEASE"),
+            args.train_root,
+            description="PairUAV training root",
+            env_names=(
+                "PAIRUAV_TRAIN_ROOT",
+                "PAIRUAV_ROOT",
+                "PAIRUAV_DATA_ROOT",
+                "PAIRUAV_PROCESSED_ROOT",
+                "PAIRUAV_UNIVERSITY_RELEASE",
+                "UNIVERSITY_RELEASE_ROOT",
+                "UNIVERSITY_RELEASE",
+            ),
             candidates=(
+                Path("/root/autodl-tmp/university/PairUAV"),
+                Path("/root/autodl-tmp/university/PairUAV-Processed"),
+                Path("/root/autodl-pub/PairUAV"),
                 Path("/root/autodl-tmp/university/University-Release/University-Release"),
                 Path("/root/autodl-tmp/university/University-Release"),
-                Path("/root/autodl-tmp/university/PairUAV"),
-                Path("/root/autodl-tmp/university/pairUAV"),
-                Path("/root/autodl-tmp/university/PairUAV-Processed"),
             ),
         )
         pairuav_root = resolve_data_root(
@@ -543,7 +553,7 @@ def main() -> None:
 
     print(f"Run directory: {run_root}")
     print(f"Mode: {args.mode}")
-    print(f"Raw root: {raw_root}")
+    print(f"Training root: {raw_root}")
     print(f"PairUAV root: {pairuav_root}")
     print(f"HF endpoint: {hf_endpoint}")
     print()
@@ -625,7 +635,7 @@ def main() -> None:
                     cache_log = logs_dir / "01_cache_train.log"
                     cache_cmd = [
                         sys.executable, "-u", str(REPO_ROOT / "utils" / "cache_features.py"),
-                        "--university-release", str(raw_root),
+                        "--data-root", str(raw_root),
                         "--cache", str(cache_train_dir),
                         "--batch-size", str(args.cache_batch_size),
                     ]
@@ -649,7 +659,7 @@ def main() -> None:
                 if args.raw:
                     train_cmd.extend([
                         "--raw", "true",
-                        "--university-release", str(raw_root),
+                        "--data-root", str(raw_root),
                         "--annotations-root", str(pairuav_root),
                         "--official-annotations", "true" if args.official_annotations else "false",
                     ])
@@ -670,7 +680,7 @@ def main() -> None:
             train_log = logs_dir / "01_train_phase1_lite.log"
             train_cmd = [
                 sys.executable, "-u", str(train_script),
-                "--university-release", str(raw_root),
+                "--data-root", str(raw_root),
                 "--model", args.phase1_model,
                 "--output", str(checkpoint_path),
                 "--num-workers", str(args.workers),

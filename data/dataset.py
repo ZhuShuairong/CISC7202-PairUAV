@@ -252,13 +252,13 @@ class PairUAVAnnotationDataset(Dataset):
 
 
 class PairDataset(Dataset):
-    """PairUAV dataset from University-Release drone image pairs.
+    """PairUAV dataset from training-view image pairs.
     
     For HARP-Pose-Lite (frozen backbone), we generate pairs by sampling
     two random drone images from the same building.
     
     Args:
-        root: Path to University-Release root
+        root: Path to PairUAV training root
         max_pairs: Maximum number of pairs (for subsampling)
         buildings: List of building IDs to use (subset for train/val split)
         seed: Random seed for reproducibility

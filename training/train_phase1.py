@@ -9,7 +9,7 @@ Loss: |sin(θ̂−θ*)| + 0.01·|d̂−d*|
 
 Usage:
     python training/train_phase1.py \
-    --university-release /path/to/University-Release \
+    --data-root /path/to/PairUAV \
         --model baseline  # or harp-lite
         --epochs 30
 """
@@ -34,8 +34,8 @@ from models.harp_pose_lite import HARPPoseLite, harp_pose_lite_loss
 
 def get_parser():
     p = argparse.ArgumentParser(description='Train baseline or HARP-Pose-Lite')
-    p.add_argument('--university-release', '--data', dest='university_release',
-                   type=str, required=True, help='Path to University-Release')
+    p.add_argument('--data-root', '--university-release', '--data', dest='data_root',
+                   type=str, required=True, help='Path to PairUAV training root')
     p.add_argument('--model', type=str, default='baseline',
                    choices=['baseline', 'harp-lite'],
                    help='Model variant')
@@ -203,14 +203,14 @@ def main():
     print(f"🖥  {torch.cuda.get_device_name(0)} | {torch.cuda.get_device_properties(0).total_mem/1e9:.1f} GB VRAM")
     
     # Dataset
-    print(f"\n📁 Dataset: {args.university_release}")
-    all_buildings = sorted(os.listdir(resolve_train_view_dir(Path(args.university_release))))
+    print(f"\n📁 Dataset: {args.data_root}")
+    all_buildings = sorted(os.listdir(resolve_train_view_dir(Path(args.data_root))))
     train_blds = all_buildings[:560]  # ~80%
     val_blds = all_buildings[560:]    # ~20%
     
-    train_ds = PairDataset(args.university_release, max_pairs=960000, buildings=train_blds, 
+    train_ds = PairDataset(args.data_root, max_pairs=960000, buildings=train_blds, 
                            seed=args.seed, is_val=False)
-    val_ds = PairDataset(args.university_release, max_pairs=20000, buildings=val_blds,
+    val_ds = PairDataset(args.data_root, max_pairs=20000, buildings=val_blds,
                          seed=args.seed + 1, is_val=True)
     
     loader_kwargs = dict(num_workers=args.num_workers, pin_memory=True)

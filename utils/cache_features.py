@@ -24,7 +24,7 @@ from data.dataset import resolve_train_view_dir
 # Feature extraction
 # ---------------------------------------------------------------------------
 
-def extract_and_cache(university_release_root: str, cache_dir: str,
+def extract_and_cache(data_root: str, cache_dir: str,
                       device: str = "cuda", batch_size: int = 32):
     """Extract layer4 features for every image and save as .npz files.
 
@@ -38,7 +38,7 @@ def extract_and_cache(university_release_root: str, cache_dir: str,
     backbone = nn.Sequential(*list(resnet.children())[:-2]).eval().to(device)
 
     transform = models.ResNet50_Weights.IMAGENET1K_V1.transforms()
-    drone_dir = resolve_train_view_dir(Path(university_release_root))
+    drone_dir = resolve_train_view_dir(Path(data_root))
     buildings = sorted(os.listdir(drone_dir))
 
     for bld in tqdm(buildings, desc="Caching buildings"):
@@ -195,11 +195,11 @@ class CachedDataset(Dataset):
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--university-release", "--data", dest="university_release",
+    p.add_argument("--data-root", "--university-release", "--data", dest="data_root",
                    type=str, required=True,
-                   help="Path to the University-Release root or processed PairUAV root")
+                   help="Path to PairUAV training root")
     p.add_argument("--cache", type=str, required=True)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--batch-size", type=int, default=32)
     args = p.parse_args()
-    extract_and_cache(args.university_release, args.cache, args.device, args.batch_size)
+    extract_and_cache(args.data_root, args.cache, args.device, args.batch_size)
