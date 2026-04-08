@@ -194,8 +194,53 @@ def has_training_images(root: Path) -> bool:
     return False
 
 
+def _candidate_nested_roots(root: Path) -> list[Path]:
+    return [
+        root,
+        root / "University-Release",
+        root / "University-Release" / "University-Release",
+        root / "PairUAV",
+        root / "pairUAV",
+        root / "pairuav",
+    ]
+
+
+def resolve_training_layout_root(root: Path) -> Path:
+    """Resolve common nested AutoDL layouts to the directory that exposes train views."""
+    from data.dataset import resolve_train_view_dir
+
+    seen: set[str] = set()
+    for candidate in _candidate_nested_roots(root):
+        key = str(candidate)
+        if key in seen or not candidate.is_dir():
+            continue
+        seen.add(key)
+        try:
+            resolve_train_view_dir(candidate)
+            return candidate.resolve()
+        except FileNotFoundError:
+            continue
+    return root.resolve()
+
+
+def resolve_annotation_supervision_root(preferred_roots: Iterable[Path]) -> Path | None:
+    from data.dataset import resolve_train_annotation_dir
+
+    seen: set[str] = set()
+    for root in preferred_roots:
+        for candidate in _candidate_nested_roots(root):
+            key = str(candidate)
+            if key in seen or not candidate.is_dir():
+                continue
+            seen.add(key)
+            if resolve_train_annotation_dir(candidate) is not None:
+                return candidate.resolve()
+    return None
+
+
 def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path,
-                    official_annotations: bool = False) -> None:
+                    official_annotations: bool = False,
+                    annotation_supervision_root: Path | None = None) -> None:
     from data.dataset import (
         PairDataset,
         PairUAVAnnotationDataset,
@@ -252,12 +297,14 @@ def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path,
 
     if official_annotations:
         def annotation_dataset_sample() -> str:
-            annotation_root = resolve_train_annotation_dir(pairuav_root)
+            supervision_root = annotation_supervision_root or pairuav_root
+            annotation_root = resolve_train_annotation_dir(supervision_root)
             if annotation_root is None:
                 raise RuntimeError(
-                    f"Official annotation mode requested, but train annotations were not found under {pairuav_root}"
+                    "Official annotation mode requested, but train annotations were not found under "
+                    f"{supervision_root}"
                 )
-            dataset = PairUAVAnnotationDataset(str(pairuav_root), max_pairs=2, seed=42, is_val=True)
+            dataset = PairUAVAnnotationDataset(str(supervision_root), max_pairs=2, seed=42, is_val=True)
             source, target, meta = dataset[0]
             return (
                 f"source={tuple(source.shape)} target={tuple(target.shape)} "
@@ -526,13 +573,23 @@ def main() -> None:
                 "UNIVERSITY_RELEASE",
             ),
             candidates=(
+                Path("/root/autodl-tmp/university/University-Release/University-Release"),
+                Path("/root/autodl-tmp/university/University-Release"),
                 Path("/root/autodl-tmp/university/PairUAV"),
                 Path("/root/autodl-tmp/university/PairUAV-Processed"),
                 Path("/root/autodl-pub/PairUAV"),
-                Path("/root/autodl-tmp/university/University-Release/University-Release"),
-                Path("/root/autodl-tmp/university/University-Release"),
             ),
         )
+        resolved_raw_root = resolve_training_layout_root(raw_root)
+        if resolved_raw_root != raw_root.resolve():
+            print(
+                "Note: resolved training root layout "
+                f"from {raw_root} to {resolved_raw_root}"
+            )
+            raw_root = resolved_raw_root
+        else:
+            raw_root = resolved_raw_root
+
         pairuav_root = resolve_data_root(
             args.pairuav_root,
             description="PairUAV submission root",
@@ -548,8 +605,26 @@ def main() -> None:
         if requested_pairuav_root is not None and not requested_pairuav_root.is_dir():
             print(f"Note: --pairuav-root {requested_pairuav_root} was not found; using detected root {pairuav_root}")
 
+    annotation_supervision_root: Path | None = None
+    if args.raw and args.official_annotations:
+        annotation_supervision_root = resolve_annotation_supervision_root(
+            preferred_roots=(pairuav_root, raw_root),
+        )
+        if annotation_supervision_root is None:
+            raise FileNotFoundError(
+                "Official annotation supervision was requested, but no train JSON annotations were found "
+                f"under {pairuav_root} or {raw_root}."
+            )
+        if annotation_supervision_root != pairuav_root:
+            print(
+                "Note: using official train annotations from "
+                f"{annotation_supervision_root}"
+            )
+
     summary["raw_root"] = str(raw_root)
     summary["pairuav_root"] = str(pairuav_root)
+    if annotation_supervision_root is not None:
+        summary["annotation_supervision_root"] = str(annotation_supervision_root)
 
     print(f"Run directory: {run_root}")
     print(f"Mode: {args.mode}")
@@ -567,6 +642,7 @@ def main() -> None:
                 pairuav_root,
                 smoke_handle,
                 official_annotations=bool(args.raw and args.official_annotations),
+                annotation_supervision_root=annotation_supervision_root,
             )
         cpu_status = "passed"
     except Exception as exc:  # noqa: BLE001
@@ -657,10 +733,11 @@ def main() -> None:
                     "--workers", str(args.workers),
                 ]
                 if args.raw:
+                    annotations_root = annotation_supervision_root or pairuav_root
                     train_cmd.extend([
                         "--raw", "true",
                         "--data-root", str(raw_root),
-                        "--annotations-root", str(pairuav_root),
+                        "--annotations-root", str(annotations_root),
                         "--official-annotations", "true" if args.official_annotations else "false",
                     ])
                 else:
