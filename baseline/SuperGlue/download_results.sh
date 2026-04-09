@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Use Hugging Face mirror for regions with restricted network access (like AutoDL)
+export HF_ENDPOINT=https://hf-mirror.com
+
 hf download --repo-type dataset YaxuanLi/UAVM_Baseline_SuperGlue_Output --local-dir .
 
 unzip train_matches_data.zip -d ../
