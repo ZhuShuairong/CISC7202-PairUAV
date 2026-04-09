@@ -1,0 +1,6 @@
+[data-prep] Command: C:\Users\zshua\anaconda3\python.exe -u --workdir C:\Users\zshua\Downloads\PairUAV\pairUAV --download-tool auto --dataset-repo YaxuanLi/UAVM_2026_test --skip-extract
+[data-prep] Working directory: C:\Users\zshua\Downloads\PairUAV
+[data-prep] unknown option --workdir
+[data-prep] usage: C:\Users\zshua\anaconda3\python.exe [option] ... [-c cmd | -m mod | file | -] [arg] ...
+[data-prep] Try `python -h' for more information.
+[data-prep] Exit code: 2 after 0s

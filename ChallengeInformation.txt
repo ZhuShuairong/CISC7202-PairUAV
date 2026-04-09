@@ -1,24 +1,79 @@
 Challenge Report, PairUAV: Last-Meter Precision Navigation for UAVs
-(Optional)
-The submission website is at https://www.codabench.org/competitions/15251/. (registered with
-your student ID or your name).
-This year’s challenge focuses on **fine-grained last-meter UAV navigation**. Given a source
-image and a target image (PairUAV dataset derived from University-1652), participants are required
-to predict the relative angle (heading) and distance (translation) needed to align the UAV with the
-target pose.
-Since the course ends early, the deadline for course credit is April 30, 2026 at 23:59 PM. Please
-take a screenshot of your best result on the CodaBench leaderboard and submit it with a short
-technical report (e.g., which model do you use?) on UMoodle by this date.
-You are strongly encouraged to continue improving your model and submit to the official Cod-
-aBench competition until the final deadline (June 30, 2026 at 23:59 AoE) for the workshop awards.
-Dataset & Submission:
-• Request the University-1652 dataset and generate the PairUAV training set using the provided
-script (usually replied within 5 minutes).
-• Submission: Upload a zip file containing only result.txt at the root.
-• Each line in result.txt should contain: angle, distance (e.g., 120.5, 35.8).
-• The number of lines must exactly match the test set.
-Check the full challenge details and baseline on the CodaBench page: https://www.codabench.
-org/competitions/15251/
-The training dataset request: https://github.com/layumi/University1652-Baseline/blob/master/
-Request.md
-If you encounter any difficulties, please feel free to contact the TAs or me.
+
+Submission website: https://www.codabench.org/competitions/15251/
+
+Task
+- Given a source image and a target image from the PairUAV dataset (derived from University-1652), predict the relative heading (angle) and distance (translation) needed to align the UAV with the target pose.
+
+Deadlines
+- Course credit: April 30, 2026, 23:59. Submit a screenshot of your best leaderboard result plus a short technical report on UMoodle.
+- Official competition: June 30, 2026, 23:59 AoE.
+
+Dataset & preparation
+- Request the University-1652 dataset using the provided template: https://github.com/layumi/University1652-Baseline/blob/master/Request.md
+- Process University-1652 into PairUAV training/test sets with: pairUAV/data_process.sh
+- This script downloads the dataset from HuggingFace and creates the PairUAV train/test split.
+
+Submission format
+- Upload a zip archive whose root contains only result.txt.
+- Each line of result.txt must contain two numeric values: angle and distance.
+- Line count must exactly match the test set.
+- Accepted formats:
+  - `120.0, 35.5`
+  - `120.0 35.5`
+
+Evaluation
+- The platform compares result.txt against hidden truth.txt.
+- Metrics reported:
+  - `angle_rel_error`
+  - `distance_rel_error`
+  - `final_score = (angle_rel_error + distance_rel_error) / 2`
+- Lower values are better.
+- The primary leaderboard ranking is `final_score`.
+
+Validation rules
+- The zip must contain `result.txt` at the archive root.
+- Do not place `result.txt` in a nested folder.
+- The number of lines must match the hidden reference.
+- Each valid line must have exactly two parseable numeric values.
+- Invalid or malformed submissions receive a large penalty.
+
+Dataset description
+- PairUAV is a fine-grained relative pose estimation dataset derived from University-1652.
+- It is designed for last-meter UAV navigation, where a UAV must align its pose to a target image in terminal-range conditions.
+- PairUAV supports target-driven navigation at scale, with over 4.8 million image pairs across 72 scenes.
+
+Starting kit
+- The official repository UAVM_2026 contains the baseline training and inference code, data processing scripts, and a short README.
+- `baseline/test_predict_output.txt` is a minimal template for `result.txt`, but the submitted file must be named `result.txt`.
+
+Environment setup (baseline)
+- Create the environment: `conda create -n uavm python=3.9`
+- Activate: `conda activate uavm`
+- Install PyTorch: `pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128`
+- Install dependencies: `pip install -r requirements.txt`
+- Download pretrained models: `huggingface-cli download Ramos-Ramos/dino-resnet-50 --local-dir models/dino_resnet`
+
+Baseline workflow
+1. Prepare data:
+   - `cd pairUAV/`
+   - `bash data_process.sh`
+   - `cd ..`
+2. Run SuperGlue feature matching (optional if you already have results):
+   - `cd baseline/SuperGlue`
+   - `bash download_results.sh`
+   - or `python gen_test_pairs.py`
+   - `bash run_train.sh`
+   - `bash run_test.sh`
+   - `cd ..`
+3. Train model:
+   - `bash run.sh`
+4. Evaluate:
+   - Package predictions and submit to https://www.codabench.org/competitions/15251/
+
+Additional references
+- Challenge homepage: https://www.codabench.org/competitions/15251/
+- Dataset processing script: https://github.com/YaxuanLi-cn/UAVM_2026/blob/main/pairUAV/data_process.sh
+- University-1652 request template: https://github.com/layumi/University1652-Baseline/blob/master/Request.md
+
+If you encounter any difficulties, contact the TAs or the challenge organizers.
