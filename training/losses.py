@@ -46,7 +46,6 @@ class PairUAVLoss:
         min_distance: float = 1.0,
         smooth_l1_beta: float = 0.05,
         weights: LossWeightConfig | None = None,
-        distance_cls_weight: float | None = None,
     ) -> None:
         if num_bins < 2:
             raise ValueError("num_bins must be >= 2")
@@ -57,11 +56,6 @@ class PairUAVLoss:
         self.min_distance = min_distance
         self.smooth_l1_beta = smooth_l1_beta
         self.weights = weights or LossWeightConfig()
-        self.distance_cls_weight = (
-            float(distance_cls_weight)
-            if distance_cls_weight is not None
-            else float(self.weights.distance_cls_weight)
-        )
 
         self.bin_centers = torch.linspace(log_distance_min, log_distance_max, num_bins, dtype=torch.float32)
 
@@ -130,7 +124,7 @@ class PairUAVLoss:
         distance_bins = self._distance_bin_targets(log_distance_target)
         distance_cls_per_sample = F.cross_entropy(distance_logits, distance_bins, reduction="none")
 
-        distance_base_per_sample = distance_reg_per_sample + self.distance_cls_weight * distance_cls_per_sample
+        distance_base_per_sample = distance_reg_per_sample + self.weights.distance_cls_weight * distance_cls_per_sample
         distance_loss = _apply_uncertainty(
             distance_base_per_sample,
             prediction.get("distance_log_var"),

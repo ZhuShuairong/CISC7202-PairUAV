@@ -7,7 +7,7 @@ import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -176,75 +176,6 @@ def split_official_json_paths(
     return train_paths, val_paths
 
 
-@dataclass(frozen=True)
-class TestPairRef:
-    pair_id: str
-    source_ref: str
-    target_ref: str
-
-
-@dataclass(frozen=True)
-class MatchProbeResult:
-    pair_key: str
-    source_ref: str
-    target_ref: str
-    found: bool
-    used_reverse: bool
-    file_path: str | None
-
-
-def resolve_test_annotation_dir(root: Path) -> Path | None:
-    candidates = (
-        root / "test",
-        root / "pairUAV" / "test",
-        root / "PairUAV" / "test",
-    )
-    for candidate in candidates:
-        if candidate.is_dir() and collect_annotation_json_paths(candidate):
-            return candidate
-    return None
-
-
-def collect_official_test_pairs(root: Path, limit: int | None = None) -> list[TestPairRef]:
-    test_dir = resolve_test_annotation_dir(root)
-    if test_dir is None:
-        return []
-
-    json_paths = collect_annotation_json_paths(test_dir)
-    if limit is not None and limit > 0:
-        json_paths = json_paths[:limit]
-
-    output: list[TestPairRef] = []
-    for path in json_paths:
-        payload = _safe_load_json(path)
-        source_ref = payload.get("image_a") or payload.get("source")
-        target_ref = payload.get("image_b") or payload.get("target")
-        if not source_ref or not target_ref:
-            continue
-
-        pair_id = str(path.relative_to(test_dir)).replace("\\", "/")
-        output.append(
-            TestPairRef(
-                pair_id=pair_id,
-                source_ref=_normalize_ref(str(source_ref)),
-                target_ref=_normalize_ref(str(target_ref)),
-            )
-        )
-    return output
-
-
-def count_official_test_pairs(root: Path) -> int:
-    test_dir = resolve_test_annotation_dir(root)
-    if test_dir is None:
-        return 0
-
-    total = 0
-    for path in test_dir.rglob("*.json"):
-        if path.is_file():
-            total += 1
-    return total
-
-
 class OfflineMatchFeatureStore:
     """Lazy loader for precomputed local correspondence summaries."""
 
@@ -300,56 +231,6 @@ class OfflineMatchFeatureStore:
                     candidates.append(self.match_root / f"{base}{ext}")
 
         return candidates
-
-    def _resolve_match_file(self, source_id: str, target_id: str) -> tuple[Path | None, bool]:
-        file_path = self.index.get(build_pair_key(source_id, target_id))
-        reverse_used = False
-
-        if file_path is None and self.match_root is not None:
-            for candidate in self._candidate_paths(source_id, target_id):
-                if candidate.is_file():
-                    file_path = candidate
-                    break
-
-            if file_path is None:
-                reverse_key = build_pair_key(target_id, source_id)
-                file_path = self.index.get(reverse_key)
-                reverse_used = file_path is not None
-                if file_path is None:
-                    for candidate in self._candidate_paths(target_id, source_id):
-                        if candidate.is_file():
-                            file_path = candidate
-                            reverse_used = True
-                            break
-
-        if file_path is not None and not file_path.is_file():
-            return None, False
-        return file_path, reverse_used
-
-    def probe(self, source_id: str, target_id: str) -> MatchProbeResult:
-        source_ref = _normalize_ref(source_id)
-        target_ref = _normalize_ref(target_id)
-        pair_key = build_pair_key(source_ref, target_ref)
-
-        if not self.enabled:
-            return MatchProbeResult(
-                pair_key=pair_key,
-                source_ref=source_ref,
-                target_ref=target_ref,
-                found=False,
-                used_reverse=False,
-                file_path=None,
-            )
-
-        file_path, reverse_used = self._resolve_match_file(source_ref, target_ref)
-        return MatchProbeResult(
-            pair_key=pair_key,
-            source_ref=source_ref,
-            target_ref=target_ref,
-            found=file_path is not None,
-            used_reverse=reverse_used,
-            file_path=str(file_path) if file_path is not None else None,
-        )
 
     def _summary_from_dense_dict(self, payload: dict[str, Any]) -> np.ndarray:
         match_count = float(payload.get("match_count", payload.get("num_matches", 0.0)))
@@ -463,9 +344,27 @@ class OfflineMatchFeatureStore:
         if key in self.cache:
             return self.cache[key].copy()
 
-        file_path, reverse_used = self._resolve_match_file(source_id, target_id)
+        file_path = self.index.get(key)
+        reverse_used = False
 
-        if file_path is None:
+        if file_path is None and self.match_root is not None:
+            for candidate in self._candidate_paths(source_id, target_id):
+                if candidate.is_file():
+                    file_path = candidate
+                    break
+
+            if file_path is None:
+                reverse_key = build_pair_key(target_id, source_id)
+                file_path = self.index.get(reverse_key)
+                reverse_used = file_path is not None
+                if file_path is None:
+                    for candidate in self._candidate_paths(target_id, source_id):
+                        if candidate.is_file():
+                            file_path = candidate
+                            reverse_used = True
+                            break
+
+        if file_path is None or not file_path.is_file():
             self.cache[key] = self.default.copy()
             return self.cache[key].copy()
 
@@ -497,7 +396,6 @@ class PairUAVDataset(Dataset):
         match_root: str | None = None,
         match_index_file: str | None = None,
         strict_official_only: bool = False,
-        split_name: str = "train",
     ) -> None:
         self.root = Path(root).expanduser().resolve()
         self.seed = seed
@@ -505,50 +403,34 @@ class PairUAVDataset(Dataset):
         self.augment = augment and not is_val
         self.is_val = is_val
         self.min_distance = min_distance
-        self.split_name = split_name
         self.strict_official_only = strict_official_only
-        self.annotation_source_paths: list[str] = []
-        self.official_json_count = 0
+        self.requested_mode = mode.lower().strip()
+        self.annotation_dir = resolve_train_annotation_dir(self.root)
+        self.annotation_source_paths: list[Path] = []
 
-        requested_mode = mode.lower().strip()
-        if requested_mode not in {"auto", "official", "pseudo"}:
+        if self.requested_mode not in {"auto", "official", "pseudo"}:
             raise ValueError("mode must be one of: auto, official, pseudo")
-        self.requested_mode = requested_mode
 
-        annotation_dir = resolve_train_annotation_dir(self.root)
-        if self.strict_official_only and annotation_dir is None:
-            raise FileNotFoundError(
-                "strict_official_only=True but official annotation JSONs were not found under "
-                f"{self.root}"
+        if self.requested_mode == "auto":
+            self.mode = "official" if self.annotation_dir is not None else "pseudo"
+        else:
+            self.mode = self.requested_mode
+
+        if self.strict_official_only and self.mode != "official":
+            raise RuntimeError(
+                "strict_official_only is enabled, but resolved dataset mode is not official. "
+                f"requested={self.requested_mode} resolved={self.mode} root={self.root}"
             )
 
-        if requested_mode == "auto":
-            self.mode = "official" if annotation_dir is not None else "pseudo"
-        else:
-            self.mode = requested_mode
-
-        if self.mode == "official" and annotation_dir is None:
+        if self.mode == "official" and self.annotation_dir is None:
             raise FileNotFoundError(
                 f"Official mode requested but no annotation JSON folder exists under {self.root}"
             )
 
-        official_paths: list[Path] | None = None
-        if self.mode == "official":
-            assert annotation_dir is not None
-            if json_paths is None:
-                official_paths = collect_annotation_json_paths(annotation_dir)
-            else:
-                official_paths = [Path(path) for path in json_paths]
-            self.official_json_count = len(official_paths)
-            self.annotation_source_paths = [str(annotation_dir)]
-
         self.view_dir = resolve_train_view_dir(self.root)
-        if not self.annotation_source_paths:
-            self.annotation_source_paths = [str(self.view_dir)]
-
         self.records = self._build_records(
-            annotation_dir=annotation_dir,
-            json_paths=official_paths,
+            annotation_dir=self.annotation_dir,
+            json_paths=json_paths,
             buildings=buildings,
             max_pairs=max_pairs,
         )
@@ -612,6 +494,8 @@ class PairUAVDataset(Dataset):
             else:
                 paths = [Path(path) for path in json_paths]
 
+            self.annotation_source_paths = sorted(paths)
+
             for json_path in paths:
                 payload = _safe_load_json(json_path)
                 source_ref = payload.get("image_a") or payload.get("source")
@@ -652,6 +536,7 @@ class PairUAVDataset(Dataset):
                 )
 
         else:
+            self.annotation_source_paths = []
             available_buildings = sorted(path.name for path in self.view_dir.iterdir() if path.is_dir())
             used_buildings = buildings if buildings is not None else available_buildings
             used_buildings = [building for building in used_buildings if (self.view_dir / building).is_dir()]
@@ -703,41 +588,44 @@ class PairUAVDataset(Dataset):
         records.sort(key=lambda item: (item.source_id, item.target_id))
         return records
 
-    def describe(self) -> dict[str, Any]:
-        return {
-            "split": self.split_name,
-            "requested_mode": self.requested_mode,
-            "resolved_mode": self.mode,
-            "strict_official_only": self.strict_official_only,
-            "annotation_sources": self.annotation_source_paths,
-            "pair_count": len(self.records),
-            "augment": bool(self.augment),
-            "official_json_count": int(self.official_json_count),
-        }
+    def __len__(self) -> int:
+        return len(self.records)
 
-    def sample_label_preview(self, k: int = 3, seed: int | None = None) -> list[dict[str, Any]]:
-        if not self.records or k <= 0:
+    def sample_decoded_labels(self, sample_count: int = 3, seed: int | None = None) -> list[dict[str, Any]]:
+        if not self.records:
             return []
 
         rng = random.Random(self.seed if seed is None else seed)
-        count = min(k, len(self.records))
-        indices = list(range(len(self.records)))
-        chosen = rng.sample(indices, count)
+        take = min(sample_count, len(self.records))
+        indices = sorted(rng.sample(range(len(self.records)), take))
 
-        preview: list[dict[str, Any]] = []
-        for idx in chosen:
+        samples: list[dict[str, Any]] = []
+        for idx in indices:
             record = self.records[idx]
-            preview.append(
+            samples.append(
                 {
-                    "pair_key": build_pair_key(record.source_id, record.target_id),
+                    "index": idx,
+                    "source_id": record.source_id,
+                    "target_id": record.target_id,
                     "heading_deg": float(record.heading),
-                    "distance": float(record.distance),
+                    "distance_m": float(record.distance),
+                    "json_path": str(record.metadata.get("json_path", "")),
                 }
             )
-        return preview
+        return samples
 
-    def __len__(self) -> int:
-        return len(self.records)
+    def diagnostics(self, sample_count: int = 3, seed: int | None = None) -> dict[str, Any]:
+        return {
+            "requested_mode": self.requested_mode,
+            "resolved_mode": self.mode,
+            "strict_official_only": self.strict_official_only,
+            "annotation_dir": str(self.annotation_dir) if self.annotation_dir is not None else None,
+            "annotation_source_count": len(self.annotation_source_paths),
+            "annotation_sources": [str(path) for path in self.annotation_source_paths[:5]],
+            "pair_count": len(self.records),
+            "label_samples": self.sample_decoded_labels(sample_count=sample_count, seed=seed),
+            "match_feature_store_enabled": bool(self.match_store.enabled),
+        }
 
     def _resolve_image_path(self, image_ref: str) -> Path:
         normalized = _normalize_ref(image_ref)
@@ -778,8 +666,8 @@ class PairUAVDataset(Dataset):
         source_img = Image.open(source_path).convert("RGB")
         target_img = Image.open(target_path).convert("RGB")
 
-        source_tensor = cast(torch.Tensor, self.source_transform(source_img))
-        target_tensor = cast(torch.Tensor, self.target_transform(target_img))
+        source_tensor = self.source_transform(source_img)
+        target_tensor = self.target_transform(target_img)
 
         match_features = self.match_store.get(record.source_id, record.target_id)
         geometry_features = record.geometry

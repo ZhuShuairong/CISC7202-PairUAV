@@ -2,6 +2,7 @@
 3-Phase Training for HARP-Pose Dual-Path
 """
 import argparse, os, sys, time
+import random
 from pathlib import Path
 
 import torch
@@ -10,7 +11,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from utils.cache_features import CachedDataset
-from utils.metrics import comprehensive_metrics
+from utils.metrics import comprehensive_metrics, is_better_result
 from models.harp_dual_path import HARPDualPath
 from training.loss import phase1_loss, phase2_loss, laplace_nll
 
@@ -165,8 +166,38 @@ def validate(model, loader, dev, amp_dtype, phase: int, use_raw: bool):
         "final_score": metrics["final_score"],
         "sr10": metrics["sr_10m"],
         "val_loss": v_loss / max(n, 1),
+        "val_total_loss": v_loss / max(n, 1),
         "val_angle_loss": v_angle / max(n, 1),
     }
+
+
+def preview_label_samples(dataset, sample_count: int, seed: int) -> list[dict]:
+    if len(dataset) == 0:
+        return []
+    rng = random.Random(seed)
+    take = min(sample_count, len(dataset))
+    indices = sorted(rng.sample(range(len(dataset)), take))
+    samples: list[dict] = []
+    for idx in indices:
+        item = dataset[idx]
+        if isinstance(item, tuple):
+            _, _, meta = item
+        else:
+            meta = item
+        heading = float(meta["heading"]) if "heading" in meta else float("nan")
+        distance = float(meta["distance"]) if "distance" in meta else float("nan")
+        source = str(meta.get("source_name", meta.get("source", "")))
+        target = str(meta.get("target_name", meta.get("target", "")))
+        samples.append(
+            {
+                "index": idx,
+                "source": source,
+                "target": target,
+                "heading_deg": heading,
+                "distance_m": distance,
+            }
+        )
+    return samples
 
 
 def main():
@@ -188,6 +219,8 @@ def main():
     p.add_argument("--official-annotations", choices=["auto", "true", "false"],
                    default="auto",
                    help="Use official PairUAV train JSON labels in raw mode")
+    p.add_argument("--strict-official-only", type=parse_bool_arg, default=False,
+                   help="Abort if official annotations are unavailable (true/false)")
     p.add_argument("--early-stop", type=parse_bool_arg, default=True,
                    help="Enable MAE+loss early stopping (true/false)")
     p.add_argument("--patience", type=int, default=3,
@@ -220,6 +253,7 @@ def main():
     bs = args.batch_size or c["bs"]
     lr = args.lr or c["lr"]
     data_mode_text = "cached-features"
+    annotation_source_text = "none"
 
     if args.raw:
         from data.dataset import (
@@ -300,8 +334,19 @@ def main():
                 )
 
             data_mode_text = "official-annotations"
+            annotation_source_text = str(annotation_dir)
             print(f"Using official annotation supervision from {annotation_dir}")
         else:
+            if args.strict_official_only:
+                raise RuntimeError(
+                    "strict_official_only is enabled, but raw mode resolved to pseudo-pairs. "
+                    "Provide --annotations-root with official labels or set --official-annotations true."
+                )
+            if args.phase > 1:
+                raise RuntimeError(
+                    "Pseudo-pair supervision is warmup-only and cannot be used in Phase 2/3. "
+                    "Use official annotations for later phases."
+                )
             view_dir = resolve_train_view_dir(Path(args.data_root))
             all_bld = sorted(path.name for path in view_dir.iterdir() if path.is_dir())
             if len(all_bld) < 2:
@@ -317,6 +362,7 @@ def main():
             ds_va = PairDataset(args.data_root, buildings=va,
                                 max_pairs=20_000, seed=args.seed+1, is_val=True)
             data_mode_text = "pseudo-pairs"
+            annotation_source_text = "pseudo-from-view-split"
     else:
         all_bld = sorted(f.stem for f in Path(args.cache).glob("*.npz"))
         tr = all_bld[:560]
@@ -332,6 +378,19 @@ def main():
         loader_kwargs["prefetch_factor"] = 4
     dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True, drop_last=True, **loader_kwargs)
     dl_va = DataLoader(ds_va, batch_size=bs, shuffle=False, **loader_kwargs)
+
+    print(
+        "[DatasetDiagnostics] "
+        f"mode={data_mode_text} annotation_source={annotation_source_text} "
+        f"pair_counts train={len(ds_tr)} val={len(ds_va)}"
+    )
+    print("[DatasetDiagnostics] decoded_label_samples=")
+    for sample in preview_label_samples(ds_tr, sample_count=3, seed=args.seed):
+        print(
+            "  - "
+            f"idx={sample['index']} src={sample['source']} tgt={sample['target']} "
+            f"heading_deg={sample['heading_deg']:.3f} distance_m={sample['distance_m']:.3f}"
+        )
 
     model = HARPDualPath(frozen=c["frozen"], use_gate=c["gate"]).to(dev)
     model = model.to(memory_format=torch.channels_last)
@@ -355,6 +414,7 @@ def main():
     best_avg = float("inf")
     best_final_score = float("inf")
     best_val_loss = float("inf")
+    best_rank_metrics: dict[str, float] | None = None
     best_epoch = 0
     stale_epochs = 0
 
@@ -375,26 +435,18 @@ def main():
               f"DistRel={vm['distance_rel_error']:.4f}  "
               f"SR@10={vm['sr10']:.1f}%")
 
-        prev_best_avg = best_avg
-        prev_best_final = best_final_score
-        avg_improved = vm["avg"] < prev_best_avg - args.min_delta_avg
-        score_improved = vm["final_score"] < prev_best_final - args.min_delta_score
-        loss_improved = vm["val_loss"] < best_val_loss - args.min_delta_loss
-        score_not_regressed = vm["final_score"] <= prev_best_final + args.min_delta_score
-        progressed = score_improved or (avg_improved and score_not_regressed) or (loss_improved and score_not_regressed)
-
-        if progressed:
+        current_rank = {
+            "final_score": vm["final_score"],
+            "distance_rel_error": vm["distance_rel_error"],
+            "angle_rel_error": vm["angle_rel_error"],
+            "val_total_loss": vm["val_total_loss"],
+        }
+        if is_better_result(current_rank, best_rank_metrics):
             stale_epochs = 0
-            reasons: list[str] = []
-            if avg_improved:
-                best_avg = vm["avg"]
-                reasons.append("avg")
-            if score_improved:
-                best_final_score = vm["final_score"]
-                reasons.append("score")
-            if loss_improved and score_not_regressed:
-                best_val_loss = vm["val_loss"]
-                reasons.append("loss")
+            best_rank_metrics = current_rank
+            best_avg = min(best_avg, vm["avg"])
+            best_final_score = min(best_final_score, vm["final_score"])
+            best_val_loss = min(best_val_loss, vm["val_loss"])
             best_epoch = e + 1
             torch.save({
                 "phase": args.phase,
@@ -408,8 +460,7 @@ def main():
                 "model_state_dict": model.state_dict(),
                 "optim_state_dict": optim.state_dict(),
             }, args.checkpoint)
-            reason_text = "+".join(reasons) if reasons else "stability"
-            print(f"  ★ Best checkpoint ({reason_text})")
+            print("  ★ Best checkpoint (leaderboard-priority metric improved)")
         else:
             stale_epochs += 1
             print(f"  No validation improvement for {stale_epochs}/{args.patience} epochs")

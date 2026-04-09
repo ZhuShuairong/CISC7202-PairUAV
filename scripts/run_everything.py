@@ -160,14 +160,14 @@ def run_command(command: list[str], cwd: Path, log_path: Path, stage_name: str,
 def validate_pairuav_root(pairuav_root: Path) -> tuple[int, int]:
     from scripts.generate_submission import _discover_pairs
 
-    pairs = _discover_pairs(pairuav_root)
+    pairs, _ = _discover_pairs(pairuav_root, pair_order="official")
     if not pairs:
         raise FileNotFoundError(
             f"Could not discover any submission pairs under {pairuav_root}. "
             "Expected a manifest file, test JSON pairs, or query/gallery split directories."
         )
 
-    unique_images = {path for pair in pairs for path in pair}
+    unique_images = {pair.source for pair in pairs}.union({pair.target for pair in pairs})
     return len(pairs), len(unique_images)
 
 
@@ -320,11 +320,14 @@ def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path,
     check("pairuav layout", pairuav_layout)
 
     def submission_order_check() -> str:
-        pairs = _discover_pairs(pairuav_root)
+        pairs, source = _discover_pairs(pairuav_root, pair_order="official")
         if not pairs:
             raise RuntimeError("No submission pairs discovered")
-        first_source, first_target = pairs[0]
-        return f"pairs={len(pairs)} first=({first_source.name}, {first_target.name})"
+        first_pair = pairs[0]
+        return (
+            f"pairs={len(pairs)} source={source} "
+            f"first=({first_pair.source.name}, {first_pair.target.name})"
+        )
 
     check("submission pair order", submission_order_check)
 

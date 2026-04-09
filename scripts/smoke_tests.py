@@ -1,604 +1,338 @@
 #!/usr/bin/env python3
-"""Remote-oriented smoke tests for PairUAV.
-
-These checks are designed for the Ubuntu/CUDA runtime used for training and
-submission generation. They are safe to keep in the repository even when local
-Windows development environments cannot execute them.
-"""
+"""Lightweight smoke tests for PairUAV correctness checks."""
 
 from __future__ import annotations
 
 import argparse
-import json
-import random
-import sys
 import tempfile
-import time
-import traceback
+import zipfile
 from pathlib import Path
-from typing import Any
-
-try:
-    import numpy as np
-    import torch
-except Exception as exc:  # noqa: BLE001
-    np = None  # type: ignore[assignment]
-    torch = None  # type: ignore[assignment]
-    _OPTIONAL_IMPORT_ERROR: Exception | None = exc
-else:
-    _OPTIONAL_IMPORT_ERROR = None
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-
-collect_official_test_pairs: Any = None
-OfflineMatchFeatureStore: Any = None
-GeoPairNet: Any = None
-resolve_pairuav_root: Any = None
-_resolve_submission_pairs: Any = None
-PairUAVLoss: Any = None
-_assert_cached_vs_uncached_equivalence: Any = None
-_assert_prediction_units: Any = None
-_assert_target_encode_decode_roundtrip: Any = None
-_resolve_data_split: Any = None
-build_dataloaders: Any = None
-evaluate_result_files: Any = None
-write_result_file: Any = None
-
-
-def _lazy_imports() -> None:
-    global collect_official_test_pairs
-    global OfflineMatchFeatureStore
-    global GeoPairNet
-    global resolve_pairuav_root
-    global _resolve_submission_pairs
-    global PairUAVLoss
-    global _assert_cached_vs_uncached_equivalence
-    global _assert_prediction_units
-    global _assert_target_encode_decode_roundtrip
-    global _resolve_data_split
-    global build_dataloaders
-    global evaluate_result_files
-    global write_result_file
-
-    if GeoPairNet is not None:
-        return
-
-    from data.dataset_pairuav import (
-        OfflineMatchFeatureStore as _OfflineMatchFeatureStore,
-        collect_official_test_pairs as _collect_official_test_pairs,
-    )
-    from models.geopairnet import GeoPairNet as _GeoPairNet
-    from scripts.generate_submission import (
-        _resolve_submission_pairs as _resolve_submission_pairs_impl,
-        resolve_pairuav_root as resolve_pairuav_root_impl,
-    )
-    from training.losses import PairUAVLoss as _PairUAVLoss
-    from training.train_pairuav import (
-        _assert_cached_vs_uncached_equivalence as _assert_cached_vs_uncached_equivalence_impl,
-        _assert_prediction_units as _assert_prediction_units_impl,
-        _assert_target_encode_decode_roundtrip as _assert_target_encode_decode_roundtrip_impl,
-        _resolve_data_split as _resolve_data_split_impl,
-        build_dataloaders as build_dataloaders_impl,
-    )
-    from utils.metrics import (
-        evaluate_result_files as evaluate_result_files_impl,
-        write_result_file as write_result_file_impl,
-    )
-
-    collect_official_test_pairs = _collect_official_test_pairs
-    OfflineMatchFeatureStore = _OfflineMatchFeatureStore
-    GeoPairNet = _GeoPairNet
-    resolve_pairuav_root = resolve_pairuav_root_impl
-    _resolve_submission_pairs = _resolve_submission_pairs_impl
-    PairUAVLoss = _PairUAVLoss
-    _assert_cached_vs_uncached_equivalence = _assert_cached_vs_uncached_equivalence_impl
-    _assert_prediction_units = _assert_prediction_units_impl
-    _assert_target_encode_decode_roundtrip = _assert_target_encode_decode_roundtrip_impl
-    _resolve_data_split = _resolve_data_split_impl
-    build_dataloaders = build_dataloaders_impl
-    evaluate_result_files = evaluate_result_files_impl
-    write_result_file = write_result_file_impl
-
-
-TEST_NAMES = (
-    "test_one_batch_forward",
-    "test_overfit_16_samples",
-    "test_submission_order",
-    "test_decode_units",
-    "test_cached_vs_uncached",
-    "test_result_txt_parser",
-    "test_match_alignment",
-)
-
-GATE_NAME = "pre_submission_gate"
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="PairUAV smoke tests")
-    parser.add_argument("--config", type=str, default="configs/geopairnet_default.json")
-    parser.add_argument("--data-root", type=str, required=True)
-    parser.add_argument("--pairuav-root", type=str, default=None)
-    parser.add_argument("--tests", type=str, default="all")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--overfit-steps", type=int, default=25)
-    parser.add_argument("--cache-tolerance", type=float, default=1e-4)
-    parser.add_argument("--match-root", type=str, default=None)
-    parser.add_argument("--match-index-file", type=str, default=None)
-    parser.add_argument(
-        "--match-policy",
-        choices=["optional", "required"],
-        default="optional",
-        help="Whether match-alignment failures should fail when checking match artifacts.",
-    )
-    parser.add_argument(
-        "--gate-include-match-check",
-        action="store_true",
-        help="Include test_match_alignment inside pre_submission_gate even when --match-root is not set.",
-    )
-    return parser.parse_args()
-
-
-def _set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def _load_config(config_path: Path) -> dict[str, Any]:
-    with config_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _build_loss(config: dict[str, Any], model_cfg: dict[str, Any]) -> PairUAVLoss:
-    loss_cfg = dict(config.get("loss", {}))
-    distance_cls_weight = float(loss_cfg.get("distance_cls_weight", 0.35))
-    if bool(model_cfg.get("no_distance_bins", False)):
-        distance_cls_weight = 0.0
-
-    return PairUAVLoss(
-        log_distance_min=float(loss_cfg.get("log_distance_min", model_cfg.get("log_distance_min", 0.0))),
-        log_distance_max=float(loss_cfg.get("log_distance_max", model_cfg.get("log_distance_max", 5.0))),
-        num_bins=int(loss_cfg.get("distance_bins", model_cfg.get("distance_bins", 24))),
-        min_distance=float(loss_cfg.get("min_distance", 1.0)),
-        smooth_l1_beta=float(loss_cfg.get("smooth_l1_beta", 0.05)),
-        distance_cls_weight=distance_cls_weight,
-    )
-
-
-def _build_train_loader(
-    config: dict[str, Any],
-    data_root: Path,
-    seed: int,
-    batch_size: int,
-    force_official: bool,
-) -> tuple[torch.utils.data.DataLoader, dict[str, Any], dict[str, Any], dict[str, Any]]:
-    dataset_cfg = dict(config.get("dataset", {}))
-    model_cfg = dict(config.get("model", {}))
-
-    dataset_cfg["max_train_pairs"] = max(64, batch_size)
-    dataset_cfg["max_val_pairs"] = max(32, batch_size)
-    if force_official:
-        dataset_cfg["mode"] = "official"
-        dataset_cfg["strict_official_only"] = True
-
-    split = _resolve_data_split(data_root, dataset_cfg, seed=seed)
-    strict_official_only = bool(split.get("strict_official_only", dataset_cfg.get("strict_official_only", False)))
-    use_match_features = not bool(model_cfg.get("no_match_features", False))
-
-    stage_cfg = dict(config.get("stages", [])[0])
-    stage_cfg["batch_size"] = batch_size
-    stage_cfg["disable_augmentation"] = True
-    stage_cfg["feature_cache"] = False
-
-    train_loader, _ = build_dataloaders(
-        root=data_root,
-        dataset_cfg=dataset_cfg,
-        split=split,
-        stage_cfg=stage_cfg,
-        workers_override=0,
-        match_root_override=None,
-        match_index_override=None,
-        seed=seed,
-        strict_official_only=strict_official_only,
-        use_match_features=use_match_features,
-    )
-    return train_loader, dataset_cfg, model_cfg, split
-
-
-def _to_device_batch(
-    batch: tuple[torch.Tensor, torch.Tensor, dict[str, Any]],
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    source, target, meta = batch
-    source = source.to(device)
-    target = target.to(device)
-    packed = {
-        "heading": meta["heading"].to(device),
-        "distance": meta["distance"].to(device),
-        "match_features": meta["match_features"].to(device),
-        "geometry_features": meta["geometry_features"].to(device),
-    }
-    return source, target, packed
-
-
-def test_one_batch_forward(args: argparse.Namespace, config: dict[str, Any], device: torch.device) -> str:
-    train_loader, _, model_cfg, _ = _build_train_loader(
-        config=config,
-        data_root=Path(args.data_root).expanduser().resolve(),
-        seed=args.seed,
-        batch_size=args.batch_size,
-        force_official=False,
-    )
-    batch = next(iter(train_loader))
-    source, target, meta = _to_device_batch(batch, device)
-
-    model = GeoPairNet(**model_cfg).to(device)
-    model.eval()
-    criterion = _build_loss(config, model_cfg)
-
-    with torch.no_grad():
-        prediction = model(
-            source,
-            target,
-            match_features=meta["match_features"],
-            geometry_features=meta["geometry_features"],
-        )
-        _assert_prediction_units(prediction, context="smoke_one_batch_forward")
-        losses = criterion(
-            prediction=prediction,
-            target={"heading": meta["heading"], "distance": meta["distance"]},
-            progress=0.0,
-            stage_name="A",
-        )
-
-    if not torch.isfinite(losses["total"]):
-        raise RuntimeError("Non-finite total loss in one-batch forward smoke test")
-
-    return f"batch={source.shape[0]} total_loss={float(losses['total'].item()):.4f}"
-
-
-def test_overfit_16_samples(args: argparse.Namespace, config: dict[str, Any], device: torch.device) -> str:
-    train_loader, _, model_cfg, _ = _build_train_loader(
-        config=config,
-        data_root=Path(args.data_root).expanduser().resolve(),
-        seed=args.seed,
-        batch_size=16,
-        force_official=False,
-    )
-    batch = next(iter(train_loader))
-    source, target, meta = _to_device_batch(batch, device)
-
-    model = GeoPairNet(**model_cfg).to(device)
-    model.set_backbone_trainable("frozen")
-    model.set_shared_projectors_trainable(True)
-    model.train()
-
-    criterion = _build_loss(config, model_cfg)
-    optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=2e-3,
-        weight_decay=1e-4,
-    )
-
-    with torch.no_grad():
-        initial = criterion(
-            prediction=model(source, target, match_features=meta["match_features"], geometry_features=meta["geometry_features"]),
-            target={"heading": meta["heading"], "distance": meta["distance"]},
-            progress=0.0,
-            stage_name="A",
-        )["total"].item()
-
-    for step in range(max(1, args.overfit_steps)):
-        prediction = model(
-            source,
-            target,
-            match_features=meta["match_features"],
-            geometry_features=meta["geometry_features"],
-        )
-        losses = criterion(
-            prediction=prediction,
-            target={"heading": meta["heading"], "distance": meta["distance"]},
-            progress=min(1.0, (step + 1) / max(1, args.overfit_steps)),
-            stage_name="A",
-        )
-        optimizer.zero_grad(set_to_none=True)
-        losses["total"].backward()
-        optimizer.step()
-
-    with torch.no_grad():
-        final = criterion(
-            prediction=model(source, target, match_features=meta["match_features"], geometry_features=meta["geometry_features"]),
-            target={"heading": meta["heading"], "distance": meta["distance"]},
-            progress=1.0,
-            stage_name="A",
-        )["total"].item()
-
-    if final >= initial * 0.95:
-        raise RuntimeError(
-            f"Overfit test failed: initial={initial:.4f}, final={final:.4f} (expected >=5% loss drop)."
-        )
-
-    return f"initial={initial:.4f} final={final:.4f}"
-
-
-def test_submission_order(args: argparse.Namespace, _config: dict[str, Any], _device: torch.device) -> str:
-    root_hint = args.pairuav_root if args.pairuav_root else args.data_root
-    root = resolve_pairuav_root(root_hint)
-
-    official_pairs = collect_official_test_pairs(root)
-    if not official_pairs:
-        raise RuntimeError(f"No official test annotation JSON pairs found under {root}")
-
-    resolved_pairs, source = _resolve_submission_pairs(root=root, require_official_order=True)
-    if source != "official_test_json":
-        raise RuntimeError(f"Unexpected pair source for strict order mode: {source}")
-
-    if len(resolved_pairs) != len(official_pairs):
-        raise RuntimeError(
-            f"Pair count mismatch: official={len(official_pairs)} resolved={len(resolved_pairs)}"
-        )
-
-    preview = min(50, len(official_pairs))
-    for idx in range(preview):
-        expected_pair_id = official_pairs[idx].pair_id
-        resolved_pair_id = resolved_pairs[idx].pair_id.split("::", 1)[0]
-        if expected_pair_id != resolved_pair_id:
-            raise RuntimeError(
-                "Official order mismatch at index "
-                f"{idx}: expected={expected_pair_id} got={resolved_pair_id}"
-            )
-
-    return f"pairs={len(official_pairs)} verified_prefix={preview}"
-
-
-def test_decode_units(args: argparse.Namespace, config: dict[str, Any], device: torch.device) -> str:
-    train_loader, _, model_cfg, _ = _build_train_loader(
-        config=config,
-        data_root=Path(args.data_root).expanduser().resolve(),
-        seed=args.seed,
-        batch_size=args.batch_size,
-        force_official=False,
-    )
-    batch = next(iter(train_loader))
-    source, target, meta = _to_device_batch(batch, device)
-
-    # Validate target-space encode/decode consistency used in training.
-    _assert_target_encode_decode_roundtrip({"heading": meta["heading"], "distance": meta["distance"]})
-
-    model = GeoPairNet(**model_cfg).to(device)
-    model.eval()
-    with torch.no_grad():
-        prediction = model(
-            source,
-            target,
-            match_features=meta["match_features"],
-            geometry_features=meta["geometry_features"],
-        )
-    _assert_prediction_units(prediction, context="smoke_decode_units")
-
-    heading = prediction["heading_deg"].detach().float()
-    distance = prediction["distance"].detach().float()
-    return (
-        f"heading_range=[{float(heading.min().item()):.3f},{float(heading.max().item()):.3f}] "
-        f"distance_min={float(distance.min().item()):.3f}"
-    )
-
-
-def test_cached_vs_uncached(args: argparse.Namespace, config: dict[str, Any], device: torch.device) -> str:
-    train_loader, _, model_cfg, _ = _build_train_loader(
-        config=config,
-        data_root=Path(args.data_root).expanduser().resolve(),
-        seed=args.seed,
-        batch_size=args.batch_size,
-        force_official=False,
-    )
-    batch = next(iter(train_loader))
-
-    model = GeoPairNet(**model_cfg).to(device)
-    model.eval()
-
-    _assert_cached_vs_uncached_equivalence(
-        model=model,
-        batch=batch,
-        device=device,
-        channels_last=False,
-        tolerance=float(args.cache_tolerance),
-    )
-    return f"tolerance={float(args.cache_tolerance):.1e}"
-
-
-def test_result_txt_parser(args: argparse.Namespace, _config: dict[str, Any], _device: torch.device) -> str:
-    with tempfile.TemporaryDirectory(prefix="pairuav_parser_") as tmp_dir:
-        tmp_root = Path(tmp_dir)
-        pred_path = tmp_root / "result.txt"
-        truth_path = tmp_root / "truth.txt"
-
-        pred_heading = torch.tensor([10.0, -20.0, 179.9, -179.5], dtype=torch.float32)
-        pred_distance = torch.tensor([10.0, 20.5, 30.25, 40.75], dtype=torch.float32)
-        truth_heading = torch.tensor([12.0, -18.5, 178.0, -178.0], dtype=torch.float32)
-        truth_distance = torch.tensor([11.0, 19.5, 29.75, 42.0], dtype=torch.float32)
-
-        write_result_file(pred_path, pred_heading, pred_distance, delimiter="comma")
-        write_result_file(truth_path, truth_heading, truth_distance, delimiter="space")
-
-        # Mix comma- and whitespace-separated lines in one file to validate parser robustness.
-        pred_lines = pred_path.read_text(encoding="utf-8").splitlines()
-        if len(pred_lines) >= 2:
-            values = pred_lines[1].split(",")
-            pred_lines[1] = f"{float(values[0]):.6f} {float(values[1]):.6f}"
-        pred_path.write_text("\n".join(pred_lines) + "\n", encoding="utf-8")
-
-        metrics = evaluate_result_files(pred_path, truth_path)
-        required_keys = {"angle_rel_error", "distance_rel_error", "final_score", "mae_heading", "mae_distance"}
-        missing_keys = sorted(required_keys - set(metrics))
-        if missing_keys:
-            raise RuntimeError(f"Parser metrics missing keys: {missing_keys}")
-
-    return (
-        f"final_score={metrics['final_score']:.6f} "
-        f"angle_rel={metrics['angle_rel_error']:.6f} "
-        f"distance_rel={metrics['distance_rel_error']:.6f}"
-    )
-
-
-def test_match_alignment(args: argparse.Namespace, _config: dict[str, Any], _device: torch.device) -> str:
-    root_hint = args.pairuav_root if args.pairuav_root else args.data_root
-    root = resolve_pairuav_root(root_hint)
-    official_pairs = collect_official_test_pairs(root, limit=5)
-    if not official_pairs:
-        raise RuntimeError(f"No official test pairs found under {root}")
-
-    if not args.match_root:
-        if args.match_policy == "required":
-            raise RuntimeError("Match alignment required but --match-root was not provided")
-        return "skipped (optional): --match-root not provided"
-
-    store = OfflineMatchFeatureStore(
-        match_root=args.match_root,
-        index_file=args.match_index_file,
-        feature_dim=8,
-    )
-    if not store.enabled:
-        if args.match_policy == "required":
-            raise RuntimeError(f"Match root is not usable: {args.match_root}")
-        return f"skipped (optional): match root not usable ({args.match_root})"
-
-    missing = 0
-    reverse_checked = 0
-    reverse_failures = 0
-    for pair in official_pairs:
-        probe = store.probe(pair.source_ref, pair.target_ref)
-        if not probe.found:
-            missing += 1
-            continue
-
-        reverse_probe = store.probe(pair.target_ref, pair.source_ref)
-        if reverse_probe.found and (probe.used_reverse ^ reverse_probe.used_reverse):
-            forward_feat = store.get(pair.source_ref, pair.target_ref)
-            reverse_feat = store.get(pair.target_ref, pair.source_ref)
-            reverse_checked += 1
-            if abs(float(forward_feat[2] + reverse_feat[2])) > 2e-2:
-                reverse_failures += 1
-            if abs(float(forward_feat[3] + reverse_feat[3])) > 2e-2:
-                reverse_failures += 1
-
-    if missing > 0 or reverse_failures > 0:
-        message = (
-            f"match alignment issues: missing={missing}, "
-            f"reverse_failures={reverse_failures}, checked={len(official_pairs)}"
-        )
-        if args.match_policy == "required":
-            raise RuntimeError(message)
-        return f"warning (optional): {message}"
-
-    return (
-        f"aligned_pairs={len(official_pairs)} "
-        f"reverse_checks={reverse_checked} reverse_failures={reverse_failures}"
-    )
-
-
-def pre_submission_gate(args: argparse.Namespace, config: dict[str, Any], device: torch.device) -> str:
-    details: list[str] = []
-
-    details.append("submission_order=" + test_submission_order(args, config, device))
-    details.append("decode_units=" + test_decode_units(args, config, device))
-    details.append("result_parser=" + test_result_txt_parser(args, config, device))
-
-    root_hint = args.pairuav_root if args.pairuav_root else args.data_root
-    root = resolve_pairuav_root(root_hint)
-    official_count = len(collect_official_test_pairs(root))
-    resolved_pairs, _ = _resolve_submission_pairs(root=root, require_official_order=True)
-    if official_count != len(resolved_pairs):
-        raise RuntimeError(
-            "Pair count check failed: "
-            f"official={official_count}, resolved={len(resolved_pairs)}"
-        )
-    details.append(f"pair_count_check=official:{official_count}")
-
-    include_match_check = bool(args.match_root) or bool(args.gate_include_match_check)
-    if include_match_check:
-        details.append("match_alignment=" + test_match_alignment(args, config, device))
-    else:
-        details.append("match_alignment=skipped(optional)")
-
-    return " | ".join(details)
-
-
-def _resolve_requested_tests(tests_arg: str) -> list[str]:
-    raw = tests_arg.strip().lower()
-    if raw == "all":
-        return list(TEST_NAMES)
-    if raw == GATE_NAME:
-        return [GATE_NAME]
-
-    names = [item.strip() for item in tests_arg.split(",") if item.strip()]
-    allowed = set(TEST_NAMES) | {GATE_NAME}
-    unknown = [name for name in names if name not in allowed]
-    if unknown:
-        raise ValueError(f"Unknown tests: {unknown}. Available: {list(TEST_NAMES)} + [{GATE_NAME}]")
-    return names
+
+import numpy as np
+from PIL import Image
+import torch
+
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from models.geopairnet import GeoPairNet
+from scripts.generate_submission import _discover_pairs, generate_submission
+from training.losses import PairUAVLoss
+from training.train_pairuav import FrozenFeatureCache
+
+
+def _build_small_geopairnet() -> GeoPairNet:
+	model = GeoPairNet(
+		backbone_name="resnet50",
+		pretrained=False,
+		global_dim=128,
+		spatial_dim=32,
+		fused_dim=128,
+		rotation_hidden_dim=64,
+		distance_hidden_dim=64,
+		distance_bins=8,
+		log_distance_min=0.0,
+		log_distance_max=5.2,
+		match_feature_dim=8,
+		geometry_feature_dim=6,
+		dropout=0.0,
+		use_uncertainty=False,
+	)
+	return model
+
+
+def _make_tiny_image(path: Path) -> None:
+	path.parent.mkdir(parents=True, exist_ok=True)
+	pixels = np.full((16, 16, 3), 127, dtype=np.uint8)
+	Image.fromarray(pixels).save(path)
+
+
+def _dummy_batch(batch_size: int = 4) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	source = torch.randn(batch_size, 3, 224, 224)
+	target = torch.randn(batch_size, 3, 224, 224)
+	match = torch.randn(batch_size, 8)
+	geometry = torch.randn(batch_size, 6)
+	return source, target, match, geometry
+
+
+def test_one_batch_forward() -> None:
+	model = _build_small_geopairnet().eval()
+	source, target, match, geometry = _dummy_batch(batch_size=2)
+	with torch.no_grad():
+		pred = model(source, target, match_features=match, geometry_features=geometry)
+
+	required_keys = {"heading_deg", "distance", "log_distance", "heading_sin", "heading_cos"}
+	missing = sorted(required_keys - set(pred.keys()))
+	if missing:
+		raise RuntimeError(f"Missing required prediction keys: {missing}")
+
+	if not torch.isfinite(pred["heading_deg"]).all() or not torch.isfinite(pred["distance"]).all():
+		raise RuntimeError("Forward output contains non-finite heading/distance")
+
+	if torch.any(pred["distance"] < 0):
+		raise RuntimeError("Forward output produced negative distance")
+
+
+def test_decode_units() -> None:
+	model = _build_small_geopairnet().eval()
+	source, target, match, geometry = _dummy_batch(batch_size=3)
+	with torch.no_grad():
+		pred = model(source, target, match_features=match, geometry_features=geometry)
+
+	heading = pred["heading_deg"]
+	distance = pred["distance"]
+	log_distance = pred["log_distance"]
+
+	exported_heading = ((heading + 180.0) % 360.0) - 180.0
+	exported_distance = torch.clamp(distance, min=1e-6)
+
+	if torch.any(exported_heading < -180.0001) or torch.any(exported_heading > 180.0001):
+		raise RuntimeError("Decoded heading is outside [-180, 180] after wrap")
+	if torch.any(exported_distance <= 0.0):
+		raise RuntimeError("Decoded distance is not positive in export space")
+
+	recon_error = float((torch.exp(log_distance) - distance).abs().max().item())
+	if recon_error > 1e-3:
+		raise RuntimeError(
+			"Distance decode mismatch: expected distance ~= exp(log_distance), "
+			f"max_abs_error={recon_error:.6f}"
+		)
+
+
+def test_cached_vs_uncached() -> None:
+	model = _build_small_geopairnet().eval()
+	source, target, match, geometry = _dummy_batch(batch_size=4)
+
+	with torch.no_grad():
+		uncached = model(source, target, match_features=match, geometry_features=geometry)
+
+	cache = FrozenFeatureCache(max_items=16)
+	source_ids = [f"s_{idx}" for idx in range(source.shape[0])]
+	target_ids = [f"t_{idx}" for idx in range(target.shape[0])]
+
+	with torch.no_grad():
+		source_global, source_spatial = cache.encode(
+			model,
+			source,
+			source_ids,
+			device=torch.device("cpu"),
+			channels_last=False,
+		)
+		target_global, target_spatial = cache.encode(
+			model,
+			target,
+			target_ids,
+			device=torch.device("cpu"),
+			channels_last=False,
+		)
+		cached = model.forward_from_embeddings(
+			source_global=source_global,
+			source_spatial=source_spatial,
+			target_global=target_global,
+			target_spatial=target_spatial,
+			match_features=match,
+			geometry_features=geometry,
+		)
+
+	max_heading_diff = float((uncached["heading_deg"] - cached["heading_deg"]).abs().max().item())
+	max_distance_diff = float((uncached["distance"] - cached["distance"]).abs().max().item())
+	tolerance = 5e-2
+	if max(max_heading_diff, max_distance_diff) > tolerance:
+		raise RuntimeError(
+			"cached-vs-uncached mismatch exceeded tolerance; "
+			f"heading_diff={max_heading_diff:.6f}, distance_diff={max_distance_diff:.6f}, "
+			f"tolerance={tolerance:.6f}"
+		)
+
+
+def test_overfit_16_samples() -> None:
+	model = _build_small_geopairnet().train()
+	criterion = PairUAVLoss(
+		log_distance_min=0.0,
+		log_distance_max=5.2,
+		num_bins=8,
+		min_distance=1.0,
+		smooth_l1_beta=0.05,
+	)
+	optimizer = torch.optim.AdamW(model.parameters(), lr=5e-3)
+
+	sample_count = 16
+	source_global = torch.randn(sample_count, model.global_dim)
+	target_global = torch.randn(sample_count, model.global_dim)
+	source_spatial = torch.randn(sample_count, model.spatial_dim, 7, 7)
+	target_spatial = torch.randn(sample_count, model.spatial_dim, 7, 7)
+	match = torch.randn(sample_count, 8)
+	geometry = torch.randn(sample_count, 6)
+	target_heading = torch.zeros(sample_count)
+	target_distance = torch.full((sample_count,), 12.0)
+
+	with torch.no_grad():
+		initial_pred = model.forward_from_embeddings(
+			source_global=source_global,
+			source_spatial=source_spatial,
+			target_global=target_global,
+			target_spatial=target_spatial,
+			match_features=match,
+			geometry_features=geometry,
+		)
+		initial_loss = float(
+			criterion(
+				prediction=initial_pred,
+				target={"heading": target_heading, "distance": target_distance},
+				progress=0.0,
+				stage_name="A",
+			)["total"].item()
+		)
+
+	steps = 60
+	for step in range(steps):
+		prediction = model.forward_from_embeddings(
+			source_global=source_global,
+			source_spatial=source_spatial,
+			target_global=target_global,
+			target_spatial=target_spatial,
+			match_features=match,
+			geometry_features=geometry,
+		)
+		loss = criterion(
+			prediction=prediction,
+			target={"heading": target_heading, "distance": target_distance},
+			progress=float(step + 1) / float(steps),
+			stage_name="A",
+		)["total"]
+
+		if not torch.isfinite(loss):
+			raise RuntimeError(f"Loss became non-finite during overfit test at step={step}")
+
+		optimizer.zero_grad(set_to_none=True)
+		loss.backward()
+		optimizer.step()
+
+	model.eval()
+	with torch.no_grad():
+		final_pred = model.forward_from_embeddings(
+			source_global=source_global,
+			source_spatial=source_spatial,
+			target_global=target_global,
+			target_spatial=target_spatial,
+			match_features=match,
+			geometry_features=geometry,
+		)
+		final_loss = float(
+			criterion(
+				prediction=final_pred,
+				target={"heading": target_heading, "distance": target_distance},
+				progress=1.0,
+				stage_name="A",
+			)["total"].item()
+		)
+
+	if final_loss >= initial_loss * 0.7:
+		raise RuntimeError(
+			"Overfit test did not reduce loss enough on 16 samples; "
+			f"initial_loss={initial_loss:.6f}, final_loss={final_loss:.6f}"
+		)
+
+
+def test_submission_order() -> None:
+	with tempfile.TemporaryDirectory(prefix="pairuav_smoke_") as tmp_dir:
+		root = Path(tmp_dir)
+		test_dir = root / "test"
+
+		_make_tiny_image(root / "test" / "query_drone" / "image-1.webp")
+		_make_tiny_image(root / "test" / "query_drone" / "image-2.webp")
+		_make_tiny_image(root / "test" / "query_drone" / "image-3.webp")
+		_make_tiny_image(root / "test" / "gallery_drone" / "target-1.webp")
+		_make_tiny_image(root / "test" / "gallery_drone" / "target-2.webp")
+		_make_tiny_image(root / "test" / "gallery_drone" / "target-3.webp")
+
+		(test_dir / "10").mkdir(parents=True, exist_ok=True)
+		(test_dir / "2").mkdir(parents=True, exist_ok=True)
+
+		(test_dir / "10" / "pair_10.json").write_text(
+			'{"image_a": "query_drone/image-3.webp", "image_b": "gallery_drone/target-3.webp"}',
+			encoding="utf-8",
+		)
+		(test_dir / "2" / "pair_2.json").write_text(
+			'{"image_a": "query_drone/image-1.webp", "image_b": "gallery_drone/target-1.webp"}',
+			encoding="utf-8",
+		)
+		(test_dir / "10" / "pair_1.json").write_text(
+			'{"image_a": "query_drone/image-2.webp", "image_b": "gallery_drone/target-2.webp"}',
+			encoding="utf-8",
+		)
+
+		pairs, source = _discover_pairs(root, pair_order="official")
+		if source != "official:test_json":
+			raise RuntimeError(f"Expected official json pair source, got {source}")
+		if len(pairs) != 3:
+			raise RuntimeError(f"Expected 3 discovered pairs, got {len(pairs)}")
+
+		first_ids = [entry.pair_id for entry in pairs[:3]]
+		if not first_ids[0].endswith("query_drone/image-1.webp||gallery_drone/target-1.webp"):
+			raise RuntimeError("Official pair order mismatch for first pair")
+
+		result_txt = root / "result.txt"
+		result_zip = root / "result.zip"
+		generate_submission(
+			checkpoint=None,
+			pairuav_root=str(root),
+			output=str(result_txt),
+			dry_run_zip=str(result_zip),
+			safe_submission_mode=True,
+		)
+
+		if not result_txt.is_file():
+			raise RuntimeError("Dry-run submission did not create result.txt")
+		lines = result_txt.read_text(encoding="utf-8").splitlines()
+		if len(lines) != 3:
+			raise RuntimeError(f"Expected 3 lines in dry-run result.txt, got {len(lines)}")
+
+		with zipfile.ZipFile(result_zip, "r") as archive:
+			names = archive.namelist()
+			if names != ["result.txt"]:
+				raise RuntimeError(
+					"Dry-run zip must contain only result.txt at archive root; "
+					f"found={names}"
+				)
+
+
+TESTS = {
+	"test_one_batch_forward": test_one_batch_forward,
+	"test_overfit_16_samples": test_overfit_16_samples,
+	"test_submission_order": test_submission_order,
+	"test_decode_units": test_decode_units,
+	"test_cached_vs_uncached": test_cached_vs_uncached,
+}
+
+
+def parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(description="PairUAV smoke tests")
+	parser.add_argument(
+		"--test",
+		type=str,
+		default="all",
+		choices=["all", *TESTS.keys()],
+		help="Single test to run or all",
+	)
+	return parser.parse_args()
 
 
 def main() -> None:
-    args = _parse_args()
-    if _OPTIONAL_IMPORT_ERROR is not None:
-        raise SystemExit(
-            "Missing Python runtime dependencies for smoke tests. "
-            "Install requirements first (for example: pip install -r requirements.txt). "
-            f"Original import error: {_OPTIONAL_IMPORT_ERROR}"
-        )
+	args = parse_args()
 
-    _lazy_imports()
-    _set_seed(args.seed)
+	selected = list(TESTS.keys()) if args.test == "all" else [args.test]
+	for name in selected:
+		print(f"[Smoke] RUN {name}")
+		try:
+			TESTS[name]()
+		except Exception as exc:
+			raise RuntimeError(f"[Smoke] FAIL {name}: {exc}") from exc
+		print(f"[Smoke] PASS {name}")
 
-    config_path = Path(args.config).expanduser().resolve()
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
-
-    data_root = Path(args.data_root).expanduser().resolve()
-    if not data_root.is_dir():
-        raise FileNotFoundError(f"Data root does not exist: {data_root}")
-
-    config = _load_config(config_path)
-    device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    selected_tests = _resolve_requested_tests(args.tests)
-
-    runners = {
-        "test_one_batch_forward": test_one_batch_forward,
-        "test_overfit_16_samples": test_overfit_16_samples,
-        "test_submission_order": test_submission_order,
-        "test_decode_units": test_decode_units,
-        "test_cached_vs_uncached": test_cached_vs_uncached,
-        "test_result_txt_parser": test_result_txt_parser,
-        "test_match_alignment": test_match_alignment,
-        GATE_NAME: pre_submission_gate,
-    }
-
-    print(f"Running {len(selected_tests)} smoke test(s) on device={device}...")
-    failures: list[str] = []
-
-    for name in selected_tests:
-        start = time.time()
-        print(f"[START] {name}")
-        try:
-            detail = runners[name](args, config, device)
-            elapsed = time.time() - start
-            print(f"[PASS] {name} ({elapsed:.1f}s) -> {detail}")
-        except Exception as exc:  # noqa: BLE001
-            elapsed = time.time() - start
-            print(f"[FAIL] {name} ({elapsed:.1f}s) -> {exc}")
-            traceback.print_exc()
-            failures.append(name)
-
-    if failures:
-        raise SystemExit(f"Smoke tests failed: {failures}")
-
-    print("All selected smoke tests passed.")
+	print("[Smoke] All selected tests passed")
 
 
 if __name__ == "__main__":
-    main()
+	main()

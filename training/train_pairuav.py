@@ -8,7 +8,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -19,22 +19,23 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.dataset import resolve_train_annotation_dir, resolve_train_view_dir
-from data.dataset_pairuav import (
-    OfflineMatchFeatureStore,
-    PairUAVDataset,
-    collect_official_test_pairs,
-    count_official_test_pairs,
-    resolve_test_annotation_dir,
-    split_official_json_paths,
-)
+from data.dataset_pairuav import PairUAVDataset, split_official_json_paths
 from models.geopairnet import GeoPairNet
-from training.losses import PairUAVLoss
-from utils.metrics import comprehensive_metrics, evaluate_result_files, is_better_result, write_result_file
+from training.losses import LossWeightConfig, PairUAVLoss
+from utils.metrics import comprehensive_metrics, is_better_result
 
 
 @dataclass
 class StageRuntimeState:
     optimizer_steps: int = 0
+
+
+@dataclass(frozen=True)
+class AblationFlags:
+    no_match_features: bool = False
+    no_geometry_features: bool = False
+    no_distance_bins: bool = False
+    no_uncertainty: bool = False
 
 
 class CosineLRScheduler:
@@ -164,6 +165,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--workers", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--safe-baseline-mode",
+        action="store_true",
+        help=(
+            "Correctness-debug mode: official labels only, no cache, no EMA, no match summaries, "
+            "deterministic behavior"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -196,6 +205,93 @@ def make_grad_scaler(amp_dtype: torch.dtype | None) -> torch.cuda.amp.GradScaler
     return torch.cuda.amp.GradScaler(enabled=use_fp16)
 
 
+def _resolve_ablation_flags(ablation_cfg: dict[str, Any]) -> AblationFlags:
+    return AblationFlags(
+        no_match_features=bool(ablation_cfg.get("no_match_features", False)),
+        no_geometry_features=bool(ablation_cfg.get("no_geometry_features", False)),
+        no_distance_bins=bool(ablation_cfg.get("no_distance_bins", False)),
+        no_uncertainty=bool(ablation_cfg.get("no_uncertainty", False)),
+    )
+
+
+def _apply_safe_baseline_mode(config: dict[str, Any]) -> None:
+    dataset_cfg = config.setdefault("dataset", {})
+    training_cfg = config.setdefault("training", {})
+
+    dataset_cfg["mode"] = "official"
+    dataset_cfg["strict_official_only"] = True
+    dataset_cfg["match_root"] = None
+    dataset_cfg["match_index_file"] = None
+
+    training_cfg["use_ema"] = False
+    training_cfg["deterministic"] = True
+
+    for stage in config.get("stages", []):
+        stage["feature_cache"] = False
+        stage["disable_augmentation"] = True
+
+
+def _stage_rank(stage_name: str) -> int:
+    order = {"A": 1, "B": 2, "C": 3}
+    return order.get(stage_name.upper().strip(), 999)
+
+
+def _count_expected_test_pairs(data_root: Path) -> int | None:
+    try:
+        from scripts.generate_submission import _discover_pairs
+
+        pairs, _ = _discover_pairs(data_root, pair_order="official")
+        return len(pairs)
+    except Exception:
+        return None
+
+
+def _print_dataset_diagnostics(
+    *,
+    train_dataset: PairUAVDataset,
+    val_dataset: PairUAVDataset,
+    split: dict[str, Any],
+    dataset_cfg: dict[str, Any],
+    seed: int,
+    expected_test_pairs: int | None,
+) -> None:
+    requested_mode = str(dataset_cfg.get("mode", "auto")).lower()
+    strict_only = bool(dataset_cfg.get("strict_official_only", False))
+    print(
+        "[DatasetDiagnostics] "
+        f"mode_requested={requested_mode} mode_resolved={split['mode']} strict_official_only={strict_only}"
+    )
+
+    print(
+        "[DatasetDiagnostics] "
+        f"pair_counts train={len(train_dataset)} val={len(val_dataset)} "
+        f"test={expected_test_pairs if expected_test_pairs is not None else 'unknown'}"
+    )
+
+    train_diag = train_dataset.diagnostics(sample_count=3, seed=seed)
+    annotation_dir = train_diag["annotation_dir"]
+    print(f"[DatasetDiagnostics] annotation_dir={annotation_dir}")
+
+    annotation_sources = train_diag["annotation_sources"]
+    if annotation_sources:
+        print("[DatasetDiagnostics] annotation_sources_preview=")
+        for path in annotation_sources:
+            print(f"  - {path}")
+    else:
+        print("[DatasetDiagnostics] annotation_sources_preview=<none>")
+
+    print("[DatasetDiagnostics] decoded_label_samples=")
+    for sample in train_diag["label_samples"]:
+        print(
+            "  - "
+            f"idx={sample['index']} "
+            f"src={sample['source_id']} "
+            f"tgt={sample['target_id']} "
+            f"heading_deg={sample['heading_deg']:.3f} "
+            f"distance_m={sample['distance_m']:.3f}"
+        )
+
+
 def _stage_filter(stages: list[dict[str, Any]], requested: str) -> list[dict[str, Any]]:
     allowed = {item.strip().upper() for item in requested.split(",") if item.strip()}
     selected = [stage for stage in stages if stage["name"].upper() in allowed]
@@ -212,22 +308,15 @@ def _resolve_data_split(
     mode = str(dataset_cfg.get("mode", "auto")).lower()
     val_ratio = float(dataset_cfg.get("val_ratio", 0.1))
     strict_official_only = bool(dataset_cfg.get("strict_official_only", False))
-    allow_pseudo_warmup_only = bool(dataset_cfg.get("allow_pseudo_warmup_only", True))
 
     annotation_dir = resolve_train_annotation_dir(root)
-    if strict_official_only and annotation_dir is None:
-        raise FileNotFoundError(
-            "strict_official_only=True but no official train annotations were found under "
-            f"{root}."
-        )
-
     if mode == "auto":
         mode = "official" if annotation_dir is not None else "pseudo"
 
     if strict_official_only and mode != "official":
         raise RuntimeError(
-            "strict_official_only=True requires official dataset mode, but mode resolved to "
-            f"{mode}."
+            "strict_official_only is enabled but resolved split mode is not official. "
+            f"resolved_mode={mode} root={root}"
         )
 
     if mode == "official":
@@ -236,10 +325,7 @@ def _resolve_data_split(
         train_json, val_json = split_official_json_paths(annotation_dir, val_ratio=val_ratio, seed=seed)
         return {
             "mode": "official",
-            "requested_mode": str(dataset_cfg.get("mode", "auto")).lower(),
-            "strict_official_only": strict_official_only,
-            "allow_pseudo_warmup_only": allow_pseudo_warmup_only,
-            "annotation_source": str(annotation_dir),
+            "annotation_dir": annotation_dir,
             "train_json": train_json,
             "val_json": val_json,
         }
@@ -259,10 +345,6 @@ def _resolve_data_split(
 
     return {
         "mode": "pseudo",
-        "requested_mode": str(dataset_cfg.get("mode", "auto")).lower(),
-        "strict_official_only": strict_official_only,
-        "allow_pseudo_warmup_only": allow_pseudo_warmup_only,
-        "annotation_source": str(view_dir),
         "train_buildings": train_buildings,
         "val_buildings": val_buildings,
     }
@@ -278,7 +360,6 @@ def build_dataloaders(
     match_index_override: str | None,
     seed: int,
     strict_official_only: bool,
-    use_match_features: bool,
 ) -> tuple[DataLoader, DataLoader]:
     max_train_pairs = int(dataset_cfg.get("max_train_pairs", 960_000))
     max_val_pairs = int(dataset_cfg.get("max_val_pairs", 20_000))
@@ -288,9 +369,6 @@ def build_dataloaders(
 
     match_root = match_root_override if match_root_override is not None else dataset_cfg.get("match_root")
     match_index = match_index_override if match_index_override is not None else dataset_cfg.get("match_index_file")
-    if not use_match_features:
-        match_root = None
-        match_index = None
 
     if split["mode"] == "official":
         train_ds = PairUAVDataset(
@@ -305,7 +383,6 @@ def build_dataloaders(
             match_root=match_root,
             match_index_file=match_index,
             strict_official_only=strict_official_only,
-            split_name="train",
         )
         val_ds = PairUAVDataset(
             root=str(root),
@@ -319,7 +396,6 @@ def build_dataloaders(
             match_root=match_root,
             match_index_file=match_index,
             strict_official_only=strict_official_only,
-            split_name="val",
         )
     else:
         train_ds = PairUAVDataset(
@@ -334,7 +410,6 @@ def build_dataloaders(
             match_root=match_root,
             match_index_file=match_index,
             strict_official_only=strict_official_only,
-            split_name="train",
         )
         val_ds = PairUAVDataset(
             root=str(root),
@@ -348,7 +423,6 @@ def build_dataloaders(
             match_root=match_root,
             match_index_file=match_index,
             strict_official_only=strict_official_only,
-            split_name="val",
         )
 
     workers = workers_override if workers_override is not None else int(dataset_cfg.get("num_workers", 8))
@@ -378,382 +452,13 @@ def build_dataloaders(
     return train_loader, val_loader
 
 
-def _wrap_heading_deg(values: torch.Tensor) -> torch.Tensor:
-    return ((values + 180.0) % 360.0) - 180.0
-
-
-def _assert_target_encode_decode_roundtrip(meta: dict[str, torch.Tensor]) -> None:
-    heading = meta["heading"].detach().float()
-    distance = meta["distance"].detach().float().clamp(min=1e-6)
-
-    encoded_sin = torch.sin(torch.deg2rad(heading))
-    encoded_cos = torch.cos(torch.deg2rad(heading))
-    decoded_heading = torch.rad2deg(torch.atan2(encoded_sin, encoded_cos))
-    decoded_heading = _wrap_heading_deg(decoded_heading)
-
-    heading_error = (decoded_heading - _wrap_heading_deg(heading)).abs()
-    heading_error = torch.minimum(heading_error, 360.0 - heading_error)
-    max_heading_error = float(heading_error.max().item())
-    if max_heading_error > 1e-4:
-        raise RuntimeError(
-            "Heading encode/decode roundtrip failed: "
-            f"max error {max_heading_error:.6f} deg"
-        )
-
-    encoded_log_distance = torch.log(distance)
-    decoded_distance = torch.exp(encoded_log_distance)
-    relative_error = (decoded_distance - distance).abs() / distance.clamp(min=1e-6)
-    max_distance_rel_error = float(relative_error.max().item())
-    if max_distance_rel_error > 1e-6:
-        raise RuntimeError(
-            "Distance encode/decode roundtrip failed: "
-            f"max relative error {max_distance_rel_error:.6e}"
-        )
-
-
-def _assert_prediction_units(prediction: dict[str, torch.Tensor], context: str) -> None:
-    heading_raw = prediction["heading_deg"].detach().float()
-    distance = prediction["distance"].detach().float()
-
-    if not torch.isfinite(heading_raw).all():
-        raise RuntimeError(f"Non-finite heading prediction encountered during {context}")
-    if not torch.isfinite(distance).all():
-        raise RuntimeError(f"Non-finite distance prediction encountered during {context}")
-    if (distance <= 0.0).any():
-        minimum = float(distance.min().item())
-        raise RuntimeError(
-            f"Non-positive metric distance encountered during {context}: min={minimum:.6f}"
-        )
-
-    heading_wrapped = _wrap_heading_deg(heading_raw)
-    min_heading = float(heading_wrapped.min().item())
-    max_heading = float(heading_wrapped.max().item())
-    if min_heading < -180.0001 or max_heading > 180.0001:
-        raise RuntimeError(
-            f"Decoded heading out of benchmark-compatible range during {context}: "
-            f"[{min_heading:.4f}, {max_heading:.4f}]"
-        )
-
-
-def _print_validation_debug_samples(
-    prediction: dict[str, torch.Tensor],
-    max_samples: int,
-) -> None:
-    if max_samples <= 0:
-        return
-
-    count = min(max_samples, int(prediction["heading_deg"].shape[0]))
-    if count <= 0:
-        return
-
-    heading_sin = prediction.get("heading_sin")
-    heading_cos = prediction.get("heading_cos")
-    log_distance = prediction.get("log_distance")
-    heading_deg = prediction["heading_deg"].detach().float()
-    distance = prediction["distance"].detach().float()
-
-    print("Validation decode debug samples:")
-    for idx in range(count):
-        sin_text = "n/a" if heading_sin is None else f"{float(heading_sin[idx].item()):.4f}"
-        cos_text = "n/a" if heading_cos is None else f"{float(heading_cos[idx].item()):.4f}"
-        log_dist_text = "n/a" if log_distance is None else f"{float(log_distance[idx].item()):.4f}"
-        heading_text = float(_wrap_heading_deg(heading_deg[idx : idx + 1])[0].item())
-        distance_text = float(distance[idx].item())
-        print(
-            f"  sample[{idx}] raw(sin={sin_text}, cos={cos_text}, log_d={log_dist_text}) "
-            f"-> heading_deg={heading_text:.4f}, distance_m={distance_text:.4f}"
-        )
-
-
-def _log_dataset_debug(
-    split: dict[str, Any],
-    train_dataset: PairUAVDataset,
-    val_dataset: PairUAVDataset,
-    data_root: Path,
-    seed: int,
-) -> None:
-    train_summary = train_dataset.describe()
-    val_summary = val_dataset.describe()
-
-    train_annotation_dir = resolve_train_annotation_dir(data_root)
-    train_image_dir = resolve_train_view_dir(data_root)
-    test_annotation_dir = resolve_test_annotation_dir(data_root)
-    tour_annotation_dir: Path | None = None
-    for candidate in (data_root / "test_tour", data_root / "tour"):
-        if candidate.is_dir() and any(path.is_file() for path in candidate.rglob("*.json")):
-            tour_annotation_dir = candidate
-            break
-
-    test_image_dir: Path | None = None
-    for candidate in (
-        data_root / "test" / "drone",
-        data_root / "test",
-    ):
-        if candidate.is_dir():
-            test_image_dir = candidate
-            break
-
-    tour_image_dir: Path | None = None
-    for candidate in (
-        data_root / "test_tour" / "drone",
-        data_root / "test_tour",
-        data_root / "tour" / "drone",
-        data_root / "tour",
-    ):
-        if candidate.is_dir():
-            tour_image_dir = candidate
-            break
-
-    print("Resolved PairUAV layout:")
-    print(f"  data_root={data_root}")
-    print(f"  train_annotation_dir={train_annotation_dir}")
-    print(f"  train_image_dir={train_image_dir}")
-    print(f"  test_annotation_dir={test_annotation_dir}")
-    print(f"  test_image_dir={test_image_dir}")
-    print(f"  tour_annotation_dir={tour_annotation_dir}")
-    print(f"  tour_image_dir={tour_image_dir}")
-
-    print("Dataset summary:")
-    print(
-        f"  mode={split['mode']} (requested={split.get('requested_mode', 'auto')}) "
-        f"strict_official_only={split.get('strict_official_only', False)}"
-    )
-    print(f"  annotation_sources(train)={train_summary['annotation_sources']}")
-    print(f"  annotation_sources(val)={val_summary['annotation_sources']}")
-
-    test_pair_count = count_official_test_pairs(data_root)
-    print(
-        f"  pair_counts train={train_summary['pair_count']} "
-        f"val={val_summary['pair_count']} test={test_pair_count}"
-    )
-
-    preview_seed = seed + 17
-    train_preview = train_dataset.sample_label_preview(k=5, seed=preview_seed)
-    val_preview = val_dataset.sample_label_preview(k=5, seed=preview_seed + 1)
-
-    print("  random decoded train label samples (heading_deg, distance):")
-    for item in train_preview:
-        print(
-            f"    {item['pair_key']} -> "
-            f"heading_deg={item['heading_deg']:.4f}, distance={item['distance']:.4f}"
-        )
-
-    print("  random decoded val label samples (heading_deg, distance):")
-    for item in val_preview:
-        print(
-            f"    {item['pair_key']} -> "
-            f"heading_deg={item['heading_deg']:.4f}, distance={item['distance']:.4f}"
-        )
-
-    test_preview = collect_official_test_pairs(data_root, limit=5)
-    if test_preview:
-        print("  first official test pair ids:")
-        for item in test_preview:
-            print(f"    {item.pair_id} -> {item.source_ref} || {item.target_ref}")
-
-
-def _auto_match_root(data_root: Path, split_tag: str) -> str | None:
-    candidates = (
-        data_root / f"{split_tag}_matches_data",
-        data_root / "matches" / f"{split_tag}_matches_data",
-    )
-    for candidate in candidates:
-        if candidate.is_dir():
-            return str(candidate.resolve())
-    return None
-
-
-def _auto_match_index_file(match_root: str | None) -> str | None:
-    if not match_root:
-        return None
-
-    root = Path(match_root)
-    for name in ("index.csv", "match_index.csv", "matches.csv", "pairs.csv"):
-        candidate = root / name
-        if candidate.is_file():
-            return str(candidate.resolve())
-    return None
-
-
-def _resolve_runtime_match_store(
-    use_match_features: bool,
-    model: GeoPairNet,
-    data_root: Path,
-    match_root: str | None,
-    match_index_file: str | None,
-    match_missing_policy: str,
-) -> tuple[str | None, str | None, bool]:
-    if not use_match_features:
-        return None, None, False
-
-    policy = str(match_missing_policy).lower().strip()
-    if policy not in {"disable", "error"}:
-        policy = "disable"
-
-    if not match_root:
-        message = (
-            "Match features requested but no match_root was provided "
-            "(expected train_matches_data/ for official pipeline)."
-        )
-        if policy == "error":
-            raise FileNotFoundError(message)
-        print(f"WARNING: {message} Entering no-match-features fallback mode.")
-        return None, None, False
-
-    match_root_path = Path(match_root).expanduser().resolve()
-    if not match_root_path.is_dir():
-        message = f"Match root does not exist: {match_root_path}"
-        if policy == "error":
-            raise FileNotFoundError(message)
-        print(f"WARNING: {message}. Entering no-match-features fallback mode.")
-        return None, None, False
-
-    match_index_path: Path | None = None
-    if match_index_file:
-        match_index_path = Path(match_index_file).expanduser().resolve()
-        if not match_index_path.is_file():
-            message = f"Match index file does not exist: {match_index_path}"
-            if policy == "error":
-                raise FileNotFoundError(message)
-            print(f"WARNING: {message}. Continuing without index file.")
-            match_index_path = None
-
-    store = OfflineMatchFeatureStore(
-        match_root=str(match_root_path),
-        index_file=str(match_index_path) if match_index_path is not None else None,
-        feature_dim=int(getattr(model, "match_feature_dim", 8)),
-    )
-
-    official_pairs = collect_official_test_pairs(data_root, limit=5)
-    missing = 0
-    reverse_failures = 0
-    reverse_checked = 0
-
-    if official_pairs:
-        print("Match alignment check (official test samples):")
-    for pair in official_pairs:
-        probe = store.probe(pair.source_ref, pair.target_ref)
-        status = "FOUND" if probe.found else "MISSING"
-        reverse_text = "reverse" if probe.used_reverse else "direct"
-        print(f"  {pair.pair_id}: {status} ({reverse_text})")
-        if not probe.found:
-            missing += 1
-            continue
-
-        reverse_probe = store.probe(pair.target_ref, pair.source_ref)
-        if reverse_probe.found and (probe.used_reverse ^ reverse_probe.used_reverse):
-            forward_feat = store.get(pair.source_ref, pair.target_ref)
-            reverse_feat = store.get(pair.target_ref, pair.source_ref)
-            reverse_checked += 1
-            if abs(float(forward_feat[2] + reverse_feat[2])) > 2e-2:
-                reverse_failures += 1
-            if abs(float(forward_feat[3] + reverse_feat[3])) > 2e-2:
-                reverse_failures += 1
-
-    if reverse_checked > 0:
-        print(
-            f"  reverse-pair consistency checks: {reverse_checked} samples, "
-            f"failures={reverse_failures}"
-        )
-
-    if missing > 0 or reverse_failures > 0:
-        message = f"Match alignment failed (missing={missing}, reverse_failures={reverse_failures})"
-        if policy == "error":
-            raise RuntimeError(message)
-        print(f"WARNING: {message}. Entering no-match-features fallback mode.")
-        return None, None, False
-
-    print(
-        "Match features enabled for training: "
-        f"root={match_root_path}, index={match_index_path}"
-    )
-    return str(match_root_path), (str(match_index_path) if match_index_path is not None else None), True
-
-
-def _should_enable_feature_cache(stage_cfg: dict[str, Any], train_augment: bool) -> tuple[bool, str]:
-    if not bool(stage_cfg.get("feature_cache", False)):
-        return False, "disabled"
-
-    backbone_mode = str(stage_cfg.get("backbone_mode", "full")).lower()
-    if backbone_mode != "frozen":
-        return False, "requires backbone_mode=frozen"
-
-    if train_augment:
-        return False, "requires disable_augmentation=true for deterministic cached inputs"
-
-    return True, "enabled"
-
-
-@torch.no_grad()
-def _assert_cached_vs_uncached_equivalence(
-    model: GeoPairNet,
-    batch: tuple[torch.Tensor, torch.Tensor, dict[str, Any]],
-    device: torch.device,
-    channels_last: bool,
-    tolerance: float,
-) -> None:
-    source, target, meta = batch
-    source, target, meta = _to_device_batch(source, target, meta, device, channels_last)
-
-    previous_mode = model.training
-    model.eval()
-    direct_pred = model(
-        source,
-        target,
-        match_features=meta["match_features"],
-        geometry_features=meta["geometry_features"],
-    )
-
-    feature_cache = FrozenFeatureCache(max_items=max(128, source.shape[0] * 4))
-    source_global, source_spatial = feature_cache.encode(
-        model,
-        source,
-        meta["source_id"],
-        device=device,
-        channels_last=channels_last,
-    )
-    target_global, target_spatial = feature_cache.encode(
-        model,
-        target,
-        meta["target_id"],
-        device=device,
-        channels_last=channels_last,
-    )
-    cached_pred = model.forward_from_embeddings(
-        source_global=source_global,
-        source_spatial=source_spatial,
-        target_global=target_global,
-        target_spatial=target_spatial,
-        match_features=meta["match_features"],
-        geometry_features=meta["geometry_features"],
-    )
-
-    worst_diff = 0.0
-    worst_name = ""
-    for key in ("heading_deg", "distance", "log_distance"):
-        direct_value = direct_pred[key].detach().float()
-        cached_value = cached_pred[key].detach().float()
-        max_abs_diff = float((direct_value - cached_value).abs().max().item())
-        if max_abs_diff > worst_diff:
-            worst_diff = max_abs_diff
-            worst_name = key
-
-    if previous_mode:
-        model.train()
-
-    if worst_diff > tolerance:
-        raise RuntimeError(
-            "Cached vs uncached equivalence failed: "
-            f"max abs diff {worst_diff:.6e} on '{worst_name}' exceeds tolerance {tolerance:.6e}"
-        )
-
-
 def _to_device_batch(
     source: torch.Tensor,
     target: torch.Tensor,
     meta: dict[str, Any],
     device: torch.device,
     channels_last: bool,
+    ablation: AblationFlags,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     source = source.to(device, non_blocking=True)
     target = target.to(device, non_blocking=True)
@@ -762,15 +467,151 @@ def _to_device_batch(
         source = source.contiguous(memory_format=torch.channels_last)
         target = target.contiguous(memory_format=torch.channels_last)
 
+    match_features = meta["match_features"].to(device, non_blocking=True)
+    geometry_features = meta["geometry_features"].to(device, non_blocking=True)
+
+    if ablation.no_match_features:
+        match_features = torch.zeros_like(match_features)
+    if ablation.no_geometry_features:
+        geometry_features = torch.zeros_like(geometry_features)
+
     batch_meta = {
         "heading": meta["heading"].to(device, non_blocking=True),
         "distance": meta["distance"].to(device, non_blocking=True),
-        "match_features": meta["match_features"].to(device, non_blocking=True),
-        "geometry_features": meta["geometry_features"].to(device, non_blocking=True),
+        "match_features": match_features,
+        "geometry_features": geometry_features,
         "source_id": [str(item) for item in meta["source_id"]],
         "target_id": [str(item) for item in meta["target_id"]],
     }
     return source, target, batch_meta
+
+
+def _assert_prediction_units(prediction: dict[str, torch.Tensor], context: str) -> None:
+    heading = prediction["heading_deg"]
+    distance = prediction["distance"]
+
+    if not torch.isfinite(heading).all() or not torch.isfinite(distance).all():
+        raise RuntimeError(f"Non-finite heading/distance predictions in {context}")
+
+    wrapped_heading = ((heading + 180.0) % 360.0) - 180.0
+    if torch.any(wrapped_heading < -180.0001) or torch.any(wrapped_heading > 180.0001):
+        raise RuntimeError(f"Heading decode out of range in {context}")
+
+    if torch.any(distance < 0.0):
+        raise RuntimeError(f"Distance decode produced negative values in {context}")
+
+    export_heading = ((heading + 180.0) % 360.0) - 180.0
+    export_distance = torch.clamp(distance, min=1e-6)
+    if torch.any(export_heading < -180.0001) or torch.any(export_heading > 180.0001):
+        raise RuntimeError(f"Heading export range check failed in {context}")
+    if torch.any(export_distance <= 0.0):
+        raise RuntimeError(f"Distance export positivity check failed in {context}")
+
+    if "log_distance" in prediction:
+        reconstructed = torch.exp(prediction["log_distance"])
+        max_abs = float((reconstructed - distance).abs().max().item())
+        if max_abs > 1e-3:
+            raise RuntimeError(
+                "Distance decode inconsistency: exp(log_distance) does not match distance "
+                f"in {context} (max_abs_diff={max_abs:.6f})"
+            )
+
+
+def _print_decode_debug(
+    prediction: dict[str, torch.Tensor],
+    target_heading: torch.Tensor,
+    target_distance: torch.Tensor,
+    sample_count: int,
+) -> None:
+    count = min(sample_count, prediction["heading_deg"].shape[0])
+    if count <= 0:
+        return
+
+    heading_sin = prediction.get("heading_sin")
+    heading_cos = prediction.get("heading_cos")
+    log_distance = prediction.get("log_distance")
+
+    print("[DecodeDebug] samples=")
+    for idx in range(count):
+        sin_value = float(heading_sin[idx].item()) if heading_sin is not None else float("nan")
+        cos_value = float(heading_cos[idx].item()) if heading_cos is not None else float("nan")
+        log_d_value = float(log_distance[idx].item()) if log_distance is not None else float("nan")
+        heading_deg = float(prediction["heading_deg"][idx].item())
+        distance_m = float(prediction["distance"][idx].item())
+        tgt_heading = float(target_heading[idx].item())
+        tgt_distance_m = float(target_distance[idx].item())
+
+        print(
+            "  - "
+            f"raw_sin={sin_value:.5f} raw_cos={cos_value:.5f} raw_log_distance={log_d_value:.5f} "
+            f"decoded_heading_deg={heading_deg:.5f} decoded_distance_m={distance_m:.5f} "
+            f"target_heading_deg={tgt_heading:.5f} target_distance_m={tgt_distance_m:.5f}"
+        )
+
+
+@torch.no_grad()
+def _assert_cached_vs_uncached_equivalence(
+    model: GeoPairNet,
+    loader: DataLoader,
+    device: torch.device,
+    channels_last: bool,
+    ablation: AblationFlags,
+    tolerance: float,
+) -> None:
+    if len(loader) == 0:
+        return
+
+    batch = next(iter(loader))
+    source, target, meta = batch
+    source, target, meta = _to_device_batch(source, target, meta, device, channels_last, ablation)
+
+    model.eval()
+    uncached = model(
+        source,
+        target,
+        match_features=meta["match_features"],
+        geometry_features=meta["geometry_features"],
+    )
+
+    cache = FrozenFeatureCache(max_items=max(4, source.shape[0] * 2))
+    source_global, source_spatial = cache.encode(
+        model,
+        source,
+        meta["source_id"],
+        device=device,
+        channels_last=channels_last,
+    )
+    target_global, target_spatial = cache.encode(
+        model,
+        target,
+        meta["target_id"],
+        device=device,
+        channels_last=channels_last,
+    )
+    cached = model.forward_from_embeddings(
+        source_global=source_global,
+        source_spatial=source_spatial,
+        target_global=target_global,
+        target_spatial=target_spatial,
+        match_features=meta["match_features"],
+        geometry_features=meta["geometry_features"],
+    )
+
+    heading_diff = float((uncached["heading_deg"] - cached["heading_deg"]).abs().max().item())
+    distance_diff = float((uncached["distance"] - cached["distance"]).abs().max().item())
+    max_diff = max(heading_diff, distance_diff)
+
+    if max_diff > tolerance:
+        raise RuntimeError(
+            "Cached-vs-uncached mismatch exceeded tolerance: "
+            f"max_diff={max_diff:.6f}, heading_diff={heading_diff:.6f}, "
+            f"distance_diff={distance_diff:.6f}, tolerance={tolerance:.6f}"
+        )
+
+    print(
+        "[CacheCheck] cached_vs_uncached passed: "
+        f"heading_diff={heading_diff:.6f} distance_diff={distance_diff:.6f} tolerance={tolerance:.6f}"
+    )
 
 
 def train_one_epoch(
@@ -790,6 +631,7 @@ def train_one_epoch(
     total_epochs: int,
     runtime_state: StageRuntimeState,
     feature_cache: FrozenFeatureCache | None,
+    ablation: AblationFlags,
     ema: ModelEMA | None,
 ) -> dict[str, float]:
     model.train()
@@ -807,7 +649,7 @@ def train_one_epoch(
 
     for step, batch in enumerate(loader):
         source, target, meta = batch
-        source, target, meta = _to_device_batch(source, target, meta, device, channels_last)
+        source, target, meta = _to_device_batch(source, target, meta, device, channels_last, ablation)
 
         progress = (global_epoch_idx + float(step + 1) / max(1, len(loader))) / max(1, total_epochs)
 
@@ -850,9 +692,11 @@ def train_one_epoch(
                 stage_name=stage_name,
             )
 
-            if not torch.isfinite(losses["total"]):
+            _assert_prediction_units(prediction, context=f"train:{stage_name}:step={step}")
+            if not torch.isfinite(losses["total"]).all():
                 raise RuntimeError(
-                    f"Encountered non-finite training loss at stage={stage_name} step={step}."
+                    f"Non-finite training loss detected at stage={stage_name} step={step}: "
+                    f"loss={losses['total'].detach().cpu().item()}"
                 )
 
             scaled_loss = losses["total"] / grad_accum_steps
@@ -869,17 +713,22 @@ def train_one_epoch(
 
             if scaler.is_enabled():
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm))
+                if not math.isfinite(grad_norm):
+                    raise RuntimeError(f"Non-finite gradient norm at stage={stage_name} step={step}")
+                grad_norm_sum += grad_norm
+                grad_norm_max = max(grad_norm_max, grad_norm)
+                grad_norm_steps += 1
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm))
+                if not math.isfinite(grad_norm):
+                    raise RuntimeError(f"Non-finite gradient norm at stage={stage_name} step={step}")
+                grad_norm_sum += grad_norm
+                grad_norm_max = max(grad_norm_max, grad_norm)
+                grad_norm_steps += 1
                 optimizer.step()
-
-            grad_norm_value = float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm)
-            grad_norm_sum += grad_norm_value
-            grad_norm_max = max(grad_norm_max, grad_norm_value)
-            grad_norm_steps += 1
 
             optimizer.zero_grad(set_to_none=True)
             runtime_state.optimizer_steps += 1
@@ -900,7 +749,7 @@ def train_one_epoch(
         "train_distance_loss": loss_distance / num_steps,
         "train_weight_rotation": weight_rotation / num_steps,
         "train_weight_distance": weight_distance / num_steps,
-        "train_grad_norm": grad_norm_sum / max(1, grad_norm_steps),
+        "train_grad_norm_mean": grad_norm_sum / max(1, grad_norm_steps),
         "train_grad_norm_max": grad_norm_max,
     }
 
@@ -917,10 +766,8 @@ def validate_one_epoch(
     global_epoch_idx: int,
     total_epochs: int,
     feature_cache: FrozenFeatureCache | None,
-    debug_samples: int = 0,
-    file_result_path: Path | None = None,
-    file_truth_path: Path | None = None,
-    file_metric_parity_tolerance: float = 1e-6,
+    ablation: AblationFlags,
+    debug_decode_samples: int,
 ) -> dict[str, float]:
     model.eval()
 
@@ -932,10 +779,7 @@ def validate_one_epoch(
 
     for step, batch in enumerate(loader):
         source, target, meta = batch
-        source, target, meta = _to_device_batch(source, target, meta, device, channels_last)
-
-        if step == 0:
-            _assert_target_encode_decode_roundtrip(meta)
+        source, target, meta = _to_device_batch(source, target, meta, device, channels_last, ablation)
 
         progress = (global_epoch_idx + float(step + 1) / max(1, len(loader))) / max(1, total_epochs)
 
@@ -978,13 +822,19 @@ def validate_one_epoch(
                 stage_name=stage_name,
             )
 
-        _assert_prediction_units(prediction, context=f"validation stage={stage_name} step={step}")
-        if step == 0 and debug_samples > 0:
-            _print_validation_debug_samples(prediction, max_samples=debug_samples)
-
-        if not torch.isfinite(losses["total"]):
+        if not torch.isfinite(losses["total"]).all():
             raise RuntimeError(
-                f"Encountered non-finite validation loss at stage={stage_name} step={step}."
+                f"Non-finite validation loss detected at stage={stage_name} step={step}: "
+                f"loss={losses['total'].detach().cpu().item()}"
+            )
+
+        _assert_prediction_units(prediction, context=f"val:{stage_name}:step={step}")
+        if step == 0 and debug_decode_samples > 0:
+            _print_decode_debug(
+                prediction=prediction,
+                target_heading=meta["heading"],
+                target_distance=meta["distance"],
+                sample_count=debug_decode_samples,
             )
 
         val_loss += losses["total"].item()
@@ -1004,28 +854,6 @@ def validate_one_epoch(
 
     metrics = comprehensive_metrics(pred, target)
     metrics["val_total_loss"] = val_loss / max(1, len(loader))
-
-    if file_result_path is not None and file_truth_path is not None:
-        write_result_file(file_result_path, pred["heading"], pred["distance"], delimiter="comma")
-        write_result_file(file_truth_path, target["heading"], target["distance"], delimiter="comma")
-        file_metrics = evaluate_result_files(file_result_path, file_truth_path)
-
-        parity_keys = ("angle_rel_error", "distance_rel_error", "final_score")
-        max_delta = 0.0
-        for key in parity_keys:
-            tensor_value = float(metrics[key])
-            file_value = float(file_metrics[key])
-            delta = abs(tensor_value - file_value)
-            max_delta = max(max_delta, delta)
-            metrics[f"file_{key}"] = file_value
-
-        metrics["file_metric_parity_max_delta"] = max_delta
-        if max_delta > file_metric_parity_tolerance:
-            print(
-                "WARNING: file metric parity mismatch "
-                f"max_delta={max_delta:.3e} tol={file_metric_parity_tolerance:.3e}"
-            )
-
     return metrics
 
 
@@ -1062,71 +890,21 @@ def main() -> None:
     with config_path.open("r", encoding="utf-8") as handle:
         config = json.load(handle)
 
-    dataset_cfg = dict(config.get("dataset", {}))
-    model_cfg = dict(config.get("model", {}))
-    loss_cfg = dict(config.get("loss", {}))
-    training_cfg = dict(config.get("training", {}))
+    if args.safe_baseline_mode:
+        _apply_safe_baseline_mode(config)
+        print("Safe baseline mode is enabled.")
 
-    safe_submission_mode = bool(training_cfg.get("safe_submission_mode", False))
-    safe_baseline_mode = bool(training_cfg.get("safe_baseline_mode", False))
-    safe_overrides: list[str] = []
-    if safe_submission_mode or safe_baseline_mode:
-        if safe_submission_mode:
-            print("safe_submission_mode enabled")
-        else:
-            print("safe_baseline_mode enabled (legacy key; prefer safe_submission_mode)")
+    training_cfg = config.get("training", {})
+    dataset_cfg = config.get("dataset", {})
+    ablation = _resolve_ablation_flags(config.get("ablation", {}))
 
-        dataset_cfg["mode"] = "official"
-        dataset_cfg["strict_official_only"] = True
-        dataset_cfg["allow_pseudo_warmup_only"] = False
-        dataset_cfg["match_root"] = None
-        dataset_cfg["match_index_file"] = None
-        safe_overrides.extend(
-            [
-                "dataset.mode=official",
-                "dataset.strict_official_only=True",
-                "dataset.allow_pseudo_warmup_only=False",
-                "dataset.match_root=None",
-                "dataset.match_index_file=None",
-            ]
-        )
-
-        training_cfg["deterministic"] = True
-        training_cfg["use_ema"] = False
-        safe_overrides.extend(
-            [
-                "training.deterministic=True",
-                "training.use_ema=False",
-            ]
-        )
-
-        if safe_baseline_mode and not safe_submission_mode:
-            model_cfg["no_match_features"] = True
-            safe_overrides.append("model.no_match_features=True")
-
-        for stage in config.get("stages", []):
-            stage["feature_cache"] = False
-            stage["disable_augmentation"] = True
-        safe_overrides.extend(
-            [
-                "stages[*].feature_cache=False",
-                "stages[*].disable_augmentation=True",
-            ]
-        )
-
-        print("safe mode overrides:")
-        for item in safe_overrides:
-            print(f"  - {item}")
-
-        training_cfg["safe_submission_mode"] = True
-
-    if bool(model_cfg.pop("no_uncertainty", False)):
-        model_cfg["use_uncertainty"] = False
-
-    config["dataset"] = dataset_cfg
-    config["model"] = model_cfg
-    config["loss"] = loss_cfg
-    config["training"] = training_cfg
+    print(
+        "[Ablation] "
+        f"no_match_features={ablation.no_match_features} "
+        f"no_geometry_features={ablation.no_geometry_features} "
+        f"no_distance_bins={ablation.no_distance_bins} "
+        f"no_uncertainty={ablation.no_uncertainty}"
+    )
 
     seed = int(args.seed if args.seed is not None else training_cfg.get("seed", 42))
     deterministic = bool(training_cfg.get("deterministic", False))
@@ -1145,9 +923,15 @@ def main() -> None:
     amp_dtype = get_amp_dtype(enabled=bool(training_cfg.get("amp", True)))
     scaler = make_grad_scaler(amp_dtype)
 
+    model_cfg = dict(config.get("model", {}))
+    if ablation.no_uncertainty:
+        model_cfg["use_uncertainty"] = False
     model = GeoPairNet(**model_cfg).to(device)
 
     channels_last = bool(training_cfg.get("channels_last", True))
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
+
     model.summary()
 
     if args.resume:
@@ -1155,17 +939,15 @@ def main() -> None:
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         print(f"Loaded checkpoint: {args.resume}")
 
-    distance_cls_weight = float(loss_cfg.get("distance_cls_weight", 0.35))
-    if bool(model_cfg.get("no_distance_bins", False)):
-        distance_cls_weight = 0.0
-
+    loss_cfg = config.get("loss", {})
+    loss_weights = LossWeightConfig(distance_cls_weight=0.0) if ablation.no_distance_bins else None
     criterion = PairUAVLoss(
         log_distance_min=float(loss_cfg.get("log_distance_min", model_cfg.get("log_distance_min", 0.0))),
         log_distance_max=float(loss_cfg.get("log_distance_max", model_cfg.get("log_distance_max", 5.0))),
         num_bins=int(loss_cfg.get("distance_bins", model_cfg.get("distance_bins", 24))),
         min_distance=float(loss_cfg.get("min_distance", 1.0)),
         smooth_l1_beta=float(loss_cfg.get("smooth_l1_beta", 0.05)),
-        distance_cls_weight=distance_cls_weight,
+        weights=loss_weights,
     )
 
     all_stages = config.get("stages", [])
@@ -1173,8 +955,23 @@ def main() -> None:
         raise RuntimeError("Config must include a non-empty 'stages' list.")
     stages = _stage_filter(all_stages, args.stages)
 
+    if split["mode"] == "pseudo":
+        disallowed = [stage["name"] for stage in stages if str(stage["name"]).upper() != "A"]
+        if disallowed:
+            raise RuntimeError(
+                "Pseudo mode is warmup-only and cannot be used for final stage selection. "
+                f"Unsupported stages with pseudo mode: {disallowed}."
+            )
+        print("[DatasetMode] pseudo mode enabled for Stage A warmup only.")
+
     total_epochs = sum(int(stage["epochs"]) for stage in stages)
     global_epoch_idx = 0
+
+    ema_start_stage = str(training_cfg.get("ema_start_stage", "B")).upper()
+    debug_decode_samples = int(training_cfg.get("debug_decode_samples", 3))
+    cache_equivalence_tolerance = float(training_cfg.get("cache_equivalence_tolerance", 5e-2))
+
+    expected_test_pairs = _count_expected_test_pairs(data_root)
 
     ema = ModelEMA(model, decay=float(training_cfg.get("ema_decay", 0.999))) if bool(training_cfg.get("use_ema", True)) else None
     if args.resume and ema is not None:
@@ -1188,44 +985,11 @@ def main() -> None:
     optimizer_defaults = config.get("optimizer", {})
     grad_accum_steps = int(training_cfg.get("grad_accum_steps", 1))
     max_grad_norm = float(training_cfg.get("max_grad_norm", 1.0))
-    strict_official_only = bool(split.get("strict_official_only", dataset_cfg.get("strict_official_only", False)))
-    allow_pseudo_warmup_only = bool(
-        split.get("allow_pseudo_warmup_only", dataset_cfg.get("allow_pseudo_warmup_only", True))
-    )
-    use_match_features = not bool(model_cfg.get("no_match_features", False))
 
-    match_missing_policy = str(dataset_cfg.get("match_missing_policy", "disable"))
-    runtime_match_root = args.match_root if args.match_root is not None else dataset_cfg.get("match_root")
-    runtime_match_index = args.match_index_file if args.match_index_file is not None else dataset_cfg.get("match_index_file")
-    if use_match_features and runtime_match_root is None:
-        runtime_match_root = _auto_match_root(data_root, split_tag="train")
-        if runtime_match_root is not None:
-            print(f"Detected train match root: {runtime_match_root}")
-    if use_match_features and runtime_match_index is None:
-        runtime_match_index = _auto_match_index_file(runtime_match_root)
-        if runtime_match_index is not None:
-            print(f"Detected train match index: {runtime_match_index}")
-
-    runtime_match_root, runtime_match_index, use_match_features = _resolve_runtime_match_store(
-        use_match_features=use_match_features,
-        model=model,
-        data_root=data_root,
-        match_root=runtime_match_root,
-        match_index_file=runtime_match_index,
-        match_missing_policy=match_missing_policy,
-    )
-
-    val_debug_samples = int(training_cfg.get("validation_debug_samples", 0))
-    val_debug_every_epoch = bool(training_cfg.get("validation_debug_every_epoch", False))
-    cache_equivalence_check = bool(training_cfg.get("cache_equivalence_check", True))
-    cache_equivalence_tolerance = float(training_cfg.get("cache_equivalence_tolerance", 1e-4))
-    file_metric_parity_check = bool(training_cfg.get("file_metric_parity_check", False))
-    file_metric_parity_tolerance = float(training_cfg.get("file_metric_parity_tolerance", 1e-6))
-    file_metric_parity_dir = output_dir / "_metric_parity" if file_metric_parity_check else None
-    if file_metric_parity_dir is not None:
-        file_metric_parity_dir.mkdir(parents=True, exist_ok=True)
-
-    dataset_debug_logged = False
+    match_root_override = None if args.safe_baseline_mode else args.match_root
+    match_index_override = None if args.safe_baseline_mode else args.match_index_file
+    if args.safe_baseline_mode and (args.match_root is not None or args.match_index_file is not None):
+        print("[SafeMode] ignoring --match-root and --match-index-file")
 
     for stage in stages:
         stage_name = str(stage["name"]).upper()
@@ -1233,12 +997,6 @@ def main() -> None:
         stage_lr = float(stage["lr"])
         stage_min_lr = float(stage.get("min_lr", stage_lr * 0.05))
         stage_warmup_epochs = int(stage.get("warmup_epochs", 1))
-
-        if split["mode"] == "pseudo" and allow_pseudo_warmup_only and stage_name != "A":
-            raise RuntimeError(
-                "Pseudo mode is enabled with allow_pseudo_warmup_only=True, so only stage A is allowed. "
-                f"Got stage {stage_name}."
-            )
 
         model.set_backbone_trainable(str(stage.get("backbone_mode", "full")))
         model.set_shared_projectors_trainable(bool(stage.get("train_projectors", True)))
@@ -1249,25 +1007,53 @@ def main() -> None:
             split=split,
             stage_cfg=stage,
             workers_override=args.workers,
-            match_root_override=runtime_match_root,
-            match_index_override=runtime_match_index,
+            match_root_override=match_root_override,
+            match_index_override=match_index_override,
             seed=seed,
-            strict_official_only=strict_official_only,
-            use_match_features=use_match_features,
+            strict_official_only=bool(dataset_cfg.get("strict_official_only", False)),
         )
 
-        train_dataset = cast(PairUAVDataset, train_loader.dataset)
-        val_dataset = cast(PairUAVDataset, val_loader.dataset)
+        _print_dataset_diagnostics(
+            train_dataset=train_loader.dataset,
+            val_dataset=val_loader.dataset,
+            split=split,
+            dataset_cfg=dataset_cfg,
+            seed=seed,
+            expected_test_pairs=expected_test_pairs,
+        )
 
-        if not dataset_debug_logged:
-            _log_dataset_debug(
-                split=split,
-                train_dataset=train_dataset,
-                val_dataset=val_dataset,
-                data_root=data_root,
-                seed=seed,
+        train_augment_enabled = not bool(stage.get("disable_augmentation", False))
+        backbone_mode = str(stage.get("backbone_mode", "full")).lower()
+        cache_requested = bool(stage.get("feature_cache", False))
+        cache_allowed = cache_requested and backbone_mode == "frozen" and not train_augment_enabled
+        if cache_requested and not cache_allowed:
+            reasons: list[str] = []
+            if backbone_mode != "frozen":
+                reasons.append("backbone is not frozen")
+            if train_augment_enabled:
+                reasons.append("stochastic train augmentation is enabled")
+            print("[Cache] disabled automatically because " + ", ".join(reasons))
+
+        train_feature_cache = (
+            FrozenFeatureCache(max_items=int(stage.get("feature_cache_size", 60_000)))
+            if cache_allowed
+            else None
+        )
+        val_feature_cache = (
+            FrozenFeatureCache(max_items=int(stage.get("feature_cache_size", 60_000)))
+            if cache_allowed
+            else None
+        )
+
+        if cache_allowed:
+            _assert_cached_vs_uncached_equivalence(
+                model=model,
+                loader=val_loader,
+                device=device,
+                channels_last=channels_last,
+                ablation=ablation,
+                tolerance=cache_equivalence_tolerance,
             )
-            dataset_debug_logged = True
 
         trainable_parameters = [param for param in model.parameters() if param.requires_grad]
         optimizer = torch.optim.AdamW(
@@ -1292,34 +1078,13 @@ def main() -> None:
         patience = int(stage.get("early_stop_patience", 0))
         stale = 0
 
-        train_augment = not bool(stage.get("disable_augmentation", False))
-        cache_enabled, cache_reason = _should_enable_feature_cache(stage, train_augment=train_augment)
-        if bool(stage.get("feature_cache", False)) and not cache_enabled:
-            print(f"  * Feature cache disabled for stage {stage_name}: {cache_reason}")
-
-        feature_cache_size = int(stage.get("feature_cache_size", 60_000))
-        train_feature_cache = FrozenFeatureCache(max_items=feature_cache_size) if cache_enabled else None
-        val_feature_cache = FrozenFeatureCache(max_items=feature_cache_size) if cache_enabled else None
-
-        if cache_enabled and cache_equivalence_check and len(train_loader) > 0:
-            sample_batch = next(iter(train_loader))
-            _assert_cached_vs_uncached_equivalence(
-                model=model,
-                batch=sample_batch,
-                device=device,
-                channels_last=channels_last,
-                tolerance=cache_equivalence_tolerance,
-            )
-            print(
-                f"  * Cache equivalence check passed for stage {stage_name} "
-                f"(tol={cache_equivalence_tolerance:.1e})"
-            )
+        ema_active_this_stage = ema is not None and _stage_rank(stage_name) >= _stage_rank(ema_start_stage)
 
         print(
             f"\n[Stage {stage_name}] epochs={stage_epochs} lr={stage_lr:.2e} "
             f"batch={int(stage['batch_size'])} backbone_mode={stage.get('backbone_mode', 'full')} "
-            f"cache={'on' if cache_enabled else 'off'} match_features={use_match_features} "
-            f"train_pairs={len(train_dataset)} val_pairs={len(val_dataset)}"
+            f"cache={'on' if cache_allowed else 'off'} ema={'on' if ema_active_this_stage else 'off'} "
+            f"train_pairs={len(train_loader.dataset)} val_pairs={len(val_loader.dataset)}"
         )
 
         for local_epoch in range(stage_epochs):
@@ -1342,19 +1107,13 @@ def main() -> None:
                 total_epochs=total_epochs,
                 runtime_state=runtime_state,
                 feature_cache=train_feature_cache,
-                ema=ema,
+                ablation=ablation,
+                ema=ema if ema_active_this_stage else None,
             )
 
-            if ema is not None:
+            if ema_active_this_stage and ema is not None:
                 ema.store(model)
                 ema.copy_to(model)
-
-            epoch_number = global_epoch_idx + 1
-            file_result_path = None
-            file_truth_path = None
-            if file_metric_parity_dir is not None:
-                file_result_path = file_metric_parity_dir / f"stage_{stage_name.lower()}_epoch_{epoch_number:03d}_pred.txt"
-                file_truth_path = file_metric_parity_dir / f"stage_{stage_name.lower()}_epoch_{epoch_number:03d}_truth.txt"
 
             val_metrics = validate_one_epoch(
                 model=model,
@@ -1367,13 +1126,11 @@ def main() -> None:
                 global_epoch_idx=global_epoch_idx,
                 total_epochs=total_epochs,
                 feature_cache=val_feature_cache,
-                debug_samples=val_debug_samples if (val_debug_every_epoch or local_epoch == 0) else 0,
-                file_result_path=file_result_path,
-                file_truth_path=file_truth_path,
-                file_metric_parity_tolerance=file_metric_parity_tolerance,
+                ablation=ablation,
+                debug_decode_samples=debug_decode_samples,
             )
 
-            if ema is not None:
+            if ema_active_this_stage and ema is not None:
                 ema.restore(model)
 
             elapsed = time.time() - epoch_start
@@ -1389,9 +1146,9 @@ def main() -> None:
             print(
                 f"Epoch {global_epoch_idx + 1:03d} [{stage_name}] ({elapsed:.0f}s) "
                 f"train_total={train_metrics['train_total_loss']:.4f} "
+                f"grad_norm_mean={train_metrics['train_grad_norm_mean']:.3f} "
+                f"grad_norm_max={train_metrics['train_grad_norm_max']:.3f} "
                 f"val_total={val_metrics['val_total_loss']:.4f} "
-                f"grad_norm={train_metrics['train_grad_norm']:.4f} "
-                f"grad_norm_max={train_metrics['train_grad_norm_max']:.4f} "
                 f"angle_mae={val_metrics['mae_heading']:.3f} "
                 f"distance_mae={val_metrics['mae_distance']:.3f} "
                 f"angle_rel={val_metrics['angle_rel_error']:.4f} "
@@ -1404,7 +1161,7 @@ def main() -> None:
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
-                ema=ema,
+                ema=ema if ema_active_this_stage else None,
                 config=config,
                 epoch=global_epoch_idx + 1,
                 stage_name=stage_name,
@@ -1419,7 +1176,7 @@ def main() -> None:
                     model=model,
                     optimizer=optimizer,
                     scaler=scaler,
-                    ema=ema,
+                    ema=ema if ema_active_this_stage else None,
                     config=config,
                     epoch=global_epoch_idx + 1,
                     stage_name=stage_name,
@@ -1452,15 +1209,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-

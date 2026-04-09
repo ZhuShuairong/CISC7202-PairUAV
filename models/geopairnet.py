@@ -190,9 +190,6 @@ class GeoPairNet(nn.Module):
         geometry_feature_dim: int = 6,
         dropout: float = 0.1,
         use_uncertainty: bool = True,
-        no_match_features: bool = False,
-        no_geometry_features: bool = False,
-        no_distance_bins: bool = False,
     ) -> None:
         super().__init__()
 
@@ -200,9 +197,6 @@ class GeoPairNet(nn.Module):
         self.geometry_feature_dim = geometry_feature_dim
         self.global_dim = global_dim
         self.spatial_dim = spatial_dim
-        self.no_match_features = no_match_features
-        self.no_geometry_features = no_geometry_features
-        self.no_distance_bins = no_distance_bins
 
         self.backbone = SharedBackbone(
             backbone_name=backbone_name,
@@ -281,11 +275,6 @@ class GeoPairNet(nn.Module):
         match_features: torch.Tensor | None = None,
         geometry_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        if self.no_match_features:
-            match_features = None
-        if self.no_geometry_features:
-            geometry_features = None
-
         fusion_outputs = self.fusion(
             source_global=source_global,
             target_global=target_global,
@@ -305,10 +294,6 @@ class GeoPairNet(nn.Module):
             **distance_outputs,
             "heading": rotation_outputs["heading_deg"],
             "backbone_mode": torch.tensor(0.0, device=fused_features.device),
-            "distance_bins_enabled": torch.tensor(
-                0.0 if self.no_distance_bins else 1.0,
-                device=fused_features.device,
-            ),
         }
         return output
 
@@ -337,8 +322,6 @@ class GeoPairNet(nn.Module):
         text = (
             f"[GeoPairNet] backbone={self.backbone.backbone_name} "
             f"(dino_loaded={self.backbone.used_dino_weights}) "
-            f"ablations(match={self.no_match_features}, geom={self.no_geometry_features}, "
-            f"distance_bins={self.no_distance_bins}) "
             f"Total={total / 1e6:.2f}M Trainable={trainable / 1e6:.2f}M Frozen={frozen / 1e6:.2f}M"
         )
         print(text)

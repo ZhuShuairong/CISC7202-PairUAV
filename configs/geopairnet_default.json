@@ -16,22 +16,17 @@
     "match_feature_dim": 8,
     "geometry_feature_dim": 6,
     "dropout": 0.1,
-    "use_uncertainty": true,
-    "no_match_features": false,
-    "no_geometry_features": false,
-    "no_distance_bins": false
+    "use_uncertainty": true
   },
   "dataset": {
-    "mode": "official",
+    "mode": "auto",
     "strict_official_only": true,
-    "allow_pseudo_warmup_only": false,
     "val_ratio": 0.1,
     "image_size": 224,
     "max_train_pairs": 960000,
     "max_val_pairs": 20000,
     "match_root": null,
     "match_index_file": null,
-    "match_missing_policy": "disable",
     "num_workers": 12,
     "pin_memory": true,
     "persistent_workers": true,
@@ -42,8 +37,7 @@
     "log_distance_min": 0.0,
     "log_distance_max": 5.2,
     "min_distance": 1.0,
-    "smooth_l1_beta": 0.05,
-    "distance_cls_weight": 0.35
+    "smooth_l1_beta": 0.05
   },
   "optimizer": {
     "betas": [0.9, 0.999],
@@ -58,14 +52,15 @@
     "max_grad_norm": 1.0,
     "use_ema": true,
     "ema_decay": 0.999,
-    "safe_submission_mode": false,
-    "safe_baseline_mode": false,
-    "validation_debug_samples": 0,
-    "validation_debug_every_epoch": false,
-    "cache_equivalence_check": true,
-    "cache_equivalence_tolerance": 0.0001,
-    "file_metric_parity_check": true,
-    "file_metric_parity_tolerance": 0.000001
+    "ema_start_stage": "B",
+    "debug_decode_samples": 3,
+    "cache_equivalence_tolerance": 0.05
+  },
+  "ablation": {
+    "no_match_features": false,
+    "no_geometry_features": false,
+    "no_distance_bins": false,
+    "no_uncertainty": false
   },
   "stages": [
     {
@@ -78,7 +73,7 @@
       "backbone_mode": "frozen",
       "train_projectors": false,
       "disable_augmentation": true,
-      "feature_cache": true,
+      "feature_cache": false,
       "feature_cache_size": 80000,
       "early_stop_patience": 3
     },

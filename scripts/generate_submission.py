@@ -1,4 +1,4 @@
-"""Generate CodaBench submission files for PairUAV."""
+"""Generate CodaBench submission files for PairUAV with strict order parity checks."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
+import re
 import zipfile
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 from PIL import Image
@@ -22,14 +23,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from data.dataset import collect_annotation_json_paths
-from data.dataset_pairuav import (
-    OfflineMatchFeatureStore,
-    build_geometry_features,
-    build_pair_key,
-    collect_official_test_pairs,
-    resolve_test_annotation_dir,
-)
+from data.dataset_pairuav import build_geometry_features
 from models.baseline import siamese_fusion
 from models.geopairnet import GeoPairNet
 from models.harp_dual_path import HARPDualPath
@@ -56,36 +50,36 @@ DEFAULT_PAIRUAV_ROOT_CANDIDATES = (
 )
 
 
-def _auto_match_root(root: Path, split_tag: str = "test") -> str | None:
-    candidates = (
-        root / f"{split_tag}_matches_data",
-        root / "matches" / f"{split_tag}_matches_data",
-    )
-    for candidate in candidates:
-        if candidate.is_dir():
-            return str(candidate.resolve())
-    return None
-
-
-def _auto_match_index_file(match_root: str | None) -> str | None:
-    if not match_root:
-        return None
-
-    root = Path(match_root)
-    for name in ("index.csv", "match_index.csv", "matches.csv", "pairs.csv"):
-        candidate = root / name
-        if candidate.is_file():
-            return str(candidate.resolve())
-    return None
+PairOrderMode = Literal["official", "auto"]
+DelimiterMode = Literal["comma", "space"]
 
 
 @dataclass(frozen=True)
-class SubmissionPair:
+class PairEntry:
     source: Path
     target: Path
-    pair_id: str
     source_ref: str
     target_ref: str
+    pair_id: str
+
+
+def _normalize_ref(ref: str) -> str:
+    return ref.strip().replace("\\", "/").lstrip("./")
+
+
+def _natural_sort_key(text: str) -> tuple[Any, ...]:
+    pieces = re.split(r"(\d+)", text.lower())
+    key: list[Any] = []
+    for piece in pieces:
+        if piece.isdigit():
+            key.append(int(piece))
+        else:
+            key.append(piece)
+    return tuple(key)
+
+
+def _pair_identifier(index: int, source_ref: str, target_ref: str) -> str:
+    return f"{index:06d}:{source_ref}||{target_ref}"
 
 
 def resolve_pairuav_root(root: str | None) -> Path:
@@ -130,7 +124,7 @@ def _is_image_file(path: Path) -> bool:
 def _scan_image_files(root: Path) -> list[Path]:
     return sorted(
         [path for path in root.rglob("*") if _is_image_file(path)],
-        key=lambda path: str(path.relative_to(root)).replace("\\", "/").lower(),
+        key=lambda path: _natural_sort_key(str(path.relative_to(root)).replace("\\", "/")),
     )
 
 
@@ -155,7 +149,7 @@ def _resolve_image_ref(
     if candidate.is_absolute() and candidate.exists():
         return candidate
 
-    normalized = ref.strip().lstrip("./").replace("\\", "/")
+    normalized = _normalize_ref(ref)
     direct = root / normalized
     if direct.exists():
         return direct
@@ -180,8 +174,8 @@ def _parse_manifest(
     root: Path,
     by_relative: dict[str, Path],
     by_name: dict[str, list[Path]],
-) -> list[tuple[Path, Path]]:
-    pairs: list[tuple[Path, Path]] = []
+) -> list[PairEntry]:
+    pairs: list[PairEntry] = []
 
     with manifest.open("r", encoding="utf-8", newline="") as handle:
         for raw_line in handle:
@@ -199,10 +193,68 @@ def _parse_manifest(
             if len(fields) < 2:
                 continue
 
-            source = _resolve_image_ref(fields[0], root, by_relative, by_name)
-            target = _resolve_image_ref(fields[1], root, by_relative, by_name)
-            if source is not None and target is not None:
-                pairs.append((source, target))
+            source_ref = _normalize_ref(fields[0])
+            target_ref = _normalize_ref(fields[1])
+            source = _resolve_image_ref(source_ref, root, by_relative, by_name)
+            target = _resolve_image_ref(target_ref, root, by_relative, by_name)
+            if source is None or target is None:
+                continue
+
+            pair_index = len(pairs) + 1
+            pairs.append(
+                PairEntry(
+                    source=source,
+                    target=target,
+                    source_ref=source_ref,
+                    target_ref=target_ref,
+                    pair_id=_pair_identifier(pair_index, source_ref, target_ref),
+                )
+            )
+
+    return pairs
+
+
+def _collect_official_json_pairs(
+    root: Path,
+    by_relative: dict[str, Path],
+    by_name: dict[str, list[Path]],
+) -> list[PairEntry]:
+    test_root = root / "test"
+    if not test_root.is_dir():
+        return []
+
+    json_paths = sorted(
+        [path for path in test_root.rglob("*.json") if path.is_file()],
+        key=lambda path: _natural_sort_key(str(path.relative_to(test_root)).replace("\\", "/")),
+    )
+    pairs: list[PairEntry] = []
+
+    for json_path in json_paths:
+        with json_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        source_raw = payload.get("image_a") or payload.get("source")
+        target_raw = payload.get("image_b") or payload.get("target")
+        if not source_raw or not target_raw:
+            continue
+
+        source_ref = _normalize_ref(str(source_raw))
+        target_ref = _normalize_ref(str(target_raw))
+        source = _resolve_image_ref(source_ref, root, by_relative, by_name)
+        target = _resolve_image_ref(target_ref, root, by_relative, by_name)
+        if source is None or target is None:
+            continue
+
+        pair_index = len(pairs) + 1
+        pairs.append(
+            PairEntry(
+                source=source,
+                target=target,
+                source_ref=source_ref,
+                target_ref=target_ref,
+                pair_id=_pair_identifier(pair_index, source_ref, target_ref),
+            )
+        )
 
     return pairs
 
@@ -214,7 +266,7 @@ def _group_image_sets(directory: Path) -> dict[str, list[Path]]:
         return {"": images} if images else {}
 
     grouped: dict[str, list[Path]] = {}
-    for subdir in sorted(subdirs, key=lambda path: path.name.lower()):
+    for subdir in sorted(subdirs, key=lambda path: _natural_sort_key(path.name)):
         grouped[subdir.name] = _scan_image_files(subdir)
     return grouped
 
@@ -237,112 +289,42 @@ def _find_split_pair_dirs(root: Path) -> tuple[Path, Path] | None:
     return None
 
 
-def _resolve_official_test_annotation_dir(root: Path) -> Path | None:
-    return resolve_test_annotation_dir(root)
-
-
-def _load_official_submission_pairs(
+def _discover_pairs(
     root: Path,
-    by_relative: dict[str, Path],
-    by_name: dict[str, list[Path]],
-) -> list[SubmissionPair]:
-    test_annotation_dir = _resolve_official_test_annotation_dir(root)
-    if test_annotation_dir is None:
-        return []
-
-    json_paths = collect_annotation_json_paths(test_annotation_dir)
-    output: list[SubmissionPair] = []
-    missing_refs: list[str] = []
-
-    for json_path in json_paths:
-        with json_path.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
-
-        source_ref = payload.get("image_a") or payload.get("source")
-        target_ref = payload.get("image_b") or payload.get("target")
-        if not source_ref or not target_ref:
-            continue
-
-        source = _resolve_image_ref(str(source_ref), root, by_relative, by_name)
-        target = _resolve_image_ref(str(target_ref), root, by_relative, by_name)
-        if source is None or target is None:
-            missing_refs.append(str(json_path.relative_to(root)).replace("\\", "/"))
-            continue
-
-        pair_key = build_pair_key(str(source_ref), str(target_ref))
-        pair_id = f"{str(json_path.relative_to(test_annotation_dir)).replace('\\', '/')}::{pair_key}"
-        output.append(
-            SubmissionPair(
-                source=source,
-                target=target,
-                pair_id=pair_id,
-                source_ref=str(source_ref).strip().replace("\\", "/"),
-                target_ref=str(target_ref).strip().replace("\\", "/"),
-            )
-        )
-
-    if missing_refs:
-        preview = ", ".join(missing_refs[:5])
-        raise FileNotFoundError(
-            "Official test annotations exist, but some image references could not be resolved. "
-            f"Examples: {preview}"
-        )
-
-    return output
-
-
-def _discover_pairs_fallback(root: Path) -> list[tuple[Path, Path]]:
+    pair_order: PairOrderMode = "official",
+) -> tuple[list[PairEntry], str]:
     by_relative, by_name, _ = _build_image_index(root)
 
-    test_root = root / "test"
-    if test_root.is_dir():
-        grouped: dict[str, set[str]] = defaultdict(set)
-        json_found = False
-        for subdir in sorted(test_root.iterdir(), key=lambda path: path.name.lower()):
-            if not subdir.is_dir():
-                continue
-            for json_file in sorted(subdir.glob("*.json")):
-                json_found = True
-                with json_file.open("r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-                image_a = data.get("image_a")
-                image_b = data.get("image_b")
-                if not image_a or not image_b:
-                    continue
-                grouped[str(image_a)].add(str(image_b))
+    json_pairs = _collect_official_json_pairs(root, by_relative, by_name)
+    if json_pairs:
+        return json_pairs, "official:test_json"
 
-        if json_found and grouped:
-            ordered_pairs: list[tuple[Path, Path]] = []
-            for image_a, image_b_set in sorted(grouped.items()):
-                image_a_ref = str(Path(image_a).with_suffix(".webp"))
-                for image_b in sorted(image_b_set):
-                    source = _resolve_image_ref(image_a_ref, root, by_relative, by_name)
-                    target = _resolve_image_ref(image_b, root, by_relative, by_name)
-                    if source is not None and target is not None:
-                        ordered_pairs.append((source, target))
-            if ordered_pairs:
-                return ordered_pairs
-
-    for base in (root, root / "test", root / "test_tour"):
+    for base in (root / "test", root / "test_tour", root):
         for name in PAIR_MANIFEST_NAMES:
             candidate = base / name
             if candidate.is_file():
                 pairs = _parse_manifest(candidate, root, by_relative, by_name)
                 if pairs:
-                    return pairs
+                    return pairs, f"official:manifest:{candidate}"
+
+    if pair_order == "official":
+        raise FileNotFoundError(
+            "Official pair-order mode requires test JSON pair annotations or a pair manifest under the processed "
+            f"PairUAV root, but none were found in {root}."
+        )
 
     split_dirs = _find_split_pair_dirs(root)
     if split_dirs is None:
         raise FileNotFoundError(
             f"Could not find test pair data under {root}. "
-            "Expected a manifest file or query/gallery split directories."
+            "Expected a manifest file, test JSON pairs, or query/gallery split directories."
         )
 
     query_dir, gallery_dir = split_dirs
     query_groups = _group_image_sets(query_dir)
     gallery_groups = _group_image_sets(gallery_dir)
 
-    pairs: list[tuple[Path, Path]] = []
+    fallback_pairs: list[PairEntry] = []
     common_group_names = [name for name in sorted(query_groups) if name in gallery_groups]
 
     if common_group_names:
@@ -352,66 +334,50 @@ def _discover_pairs_fallback(root: Path) -> list[tuple[Path, Path]]:
             if not query_images or not gallery_images:
                 continue
             pair_count = min(len(query_images), len(gallery_images))
-            pairs.extend(zip(query_images[:pair_count], gallery_images[:pair_count]))
-        if pairs:
-            return pairs
+            for query_image, gallery_image in zip(query_images[:pair_count], gallery_images[:pair_count]):
+                pair_index = len(fallback_pairs) + 1
+                fallback_pairs.append(
+                    PairEntry(
+                        source=query_image,
+                        target=gallery_image,
+                        source_ref=str(query_image.relative_to(root)).replace("\\", "/"),
+                        target_ref=str(gallery_image.relative_to(root)).replace("\\", "/"),
+                        pair_id=_pair_identifier(
+                            pair_index,
+                            str(query_image.relative_to(root)).replace("\\", "/"),
+                            str(gallery_image.relative_to(root)).replace("\\", "/"),
+                        ),
+                    )
+                )
+        if fallback_pairs:
+            return fallback_pairs, "fallback:grouped_split_dirs"
 
     query_flat = _scan_image_files(query_dir)
     gallery_flat = _scan_image_files(gallery_dir)
     pair_count = min(len(query_flat), len(gallery_flat))
-    return list(zip(query_flat[:pair_count], gallery_flat[:pair_count]))
 
-
-def _resolve_submission_pairs(
-    root: Path,
-    require_official_order: bool,
-) -> tuple[list[SubmissionPair], str]:
-    by_relative, by_name, _ = _build_image_index(root)
-
-    official_pairs = _load_official_submission_pairs(
-        root=root,
-        by_relative=by_relative,
-        by_name=by_name,
-    )
-    if official_pairs:
-        return official_pairs, "official_test_json"
-
-    if require_official_order:
-        raise FileNotFoundError(
-            "Official pair-order mode requested, but no official test JSON pair list was found. "
-            "Expected processed PairUAV test annotations under <pairuav_root>/test."
+    for query_image, gallery_image in zip(query_flat[:pair_count], gallery_flat[:pair_count]):
+        pair_index = len(fallback_pairs) + 1
+        fallback_pairs.append(
+            PairEntry(
+                source=query_image,
+                target=gallery_image,
+                source_ref=str(query_image.relative_to(root)).replace("\\", "/"),
+                target_ref=str(gallery_image.relative_to(root)).replace("\\", "/"),
+                pair_id=_pair_identifier(
+                    pair_index,
+                    str(query_image.relative_to(root)).replace("\\", "/"),
+                    str(gallery_image.relative_to(root)).replace("\\", "/"),
+                ),
+            )
         )
 
-    fallback = _discover_pairs_fallback(root)
-    fallback_pairs = [
-        SubmissionPair(
-            source=source,
-            target=target,
-            pair_id=f"fallback_{idx:08d}",
-            source_ref=str(source),
-            target_ref=str(target),
-        )
-        for idx, (source, target) in enumerate(fallback)
-    ]
-    return fallback_pairs, "fallback_discovery"
+    return fallback_pairs, "fallback:flat_split_dirs"
 
 
-def _discover_pairs(root: Path) -> list[tuple[Path, Path]]:
-    pairs, _ = _resolve_submission_pairs(root, require_official_order=False)
-    return [(item.source, item.target) for item in pairs]
-
-
-def _load_model(checkpoint: str, device: torch.device, use_ema: bool = False) -> tuple[torch.nn.Module, str, str]:
+def _load_model(checkpoint: str, device: torch.device) -> tuple[torch.nn.Module, str]:
     ckpt = torch.load(checkpoint, map_location=device)
-    state_source = "model_state_dict"
-    if isinstance(ckpt, dict):
-        if use_ema and ckpt.get("ema_state_dict"):
-            state_dict = ckpt["ema_state_dict"]
-            state_source = "ema_state_dict"
-        else:
-            state_dict = ckpt.get("model_state_dict", ckpt)
-    else:
-        state_dict = ckpt
+    state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     model_config = ckpt.get("model_config", {}) if isinstance(ckpt, dict) else {}
 
     geopair_keys = any(
@@ -432,28 +398,28 @@ def _load_model(checkpoint: str, device: torch.device, use_ema: bool = False) ->
     if geopair_keys:
         model = GeoPairNet(**model_config).to(device)
         model.load_state_dict(state_dict, strict=False)
-        return model.eval(), "geopairnet", state_source
+        return model.eval(), "geopairnet"
 
     if dual_path_keys and not pose_lite_keys:
         model = HARPDualPath(frozen=True, use_gate=True)
         model.phase = 2
         model.load_state_dict(state_dict, strict=False)
-        return model.eval().to(device), "dual_path", state_source
+        return model.eval().to(device), "dual_path"
 
     if pose_lite_keys:
         model = HARPPoseLite().to(device)
         model.load_state_dict(state_dict, strict=False)
-        return model.eval(), "pose_lite", state_source
+        return model.eval(), "pose_lite"
 
     try:
         model = HARPPoseLite().to(device)
         model.load_state_dict(state_dict, strict=False)
-        return model.eval(), "pose_lite", state_source
+        return model.eval(), "pose_lite"
     except Exception:
         model = HARPDualPath(frozen=True, use_gate=True)
         model.phase = 2
         model.load_state_dict(state_dict, strict=False)
-        return model.eval().to(device), "dual_path", state_source
+        return model.eval().to(device), "dual_path"
 
 
 def _feature_cache_path(cache_root: Path, root: Path, image_path: Path) -> Path:
@@ -539,44 +505,36 @@ def _extract_features(
 def _predict_pair_batch(
     model: torch.nn.Module,
     model_kind: str,
-    batch_pairs: Sequence[SubmissionPair],
+    batch_pairs: Sequence[PairEntry],
     feature_cache: dict[Path, Any],
     device: torch.device,
-    match_store: OfflineMatchFeatureStore | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor | None]]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     with torch.inference_mode():
         if model_kind == "geopairnet":
             source_global = torch.stack(
-                [feature_cache[item.source]["global"].float() for item in batch_pairs]
+                [feature_cache[pair.source]["global"].float() for pair in batch_pairs]
             ).to(device)
             source_spatial = torch.stack(
-                [feature_cache[item.source]["spatial"].float() for item in batch_pairs]
+                [feature_cache[pair.source]["spatial"].float() for pair in batch_pairs]
             ).to(device)
             target_global = torch.stack(
-                [feature_cache[item.target]["global"].float() for item in batch_pairs]
+                [feature_cache[pair.target]["global"].float() for pair in batch_pairs]
             ).to(device)
             target_spatial = torch.stack(
-                [feature_cache[item.target]["spatial"].float() for item in batch_pairs]
+                [feature_cache[pair.target]["spatial"].float() for pair in batch_pairs]
             ).to(device)
 
             geometry_np = np.stack(
-                [build_geometry_features(item.source_ref, item.target_ref) for item in batch_pairs],
+                [build_geometry_features(pair.source.name, pair.target.name) for pair in batch_pairs],
                 axis=0,
             )
             geometry = torch.from_numpy(geometry_np).to(device=device, dtype=torch.float32)
-            if match_store is not None and match_store.enabled:
-                match_np = np.stack(
-                    [match_store.get(item.source_ref, item.target_ref) for item in batch_pairs],
-                    axis=0,
-                )
-                match = torch.from_numpy(match_np).to(device=device, dtype=torch.float32)
-            else:
-                match = torch.zeros(
-                    len(batch_pairs),
-                    int(getattr(model, "match_feature_dim", 8)),
-                    device=device,
-                    dtype=torch.float32,
-                )
+            match = torch.zeros(
+                len(batch_pairs),
+                int(getattr(model, "match_feature_dim", 8)),
+                device=device,
+                dtype=torch.float32,
+            )
 
             pred = model.forward_from_embeddings(  # type: ignore[attr-defined]
                 source_global=source_global,
@@ -588,428 +546,175 @@ def _predict_pair_batch(
             )
             heading = pred["heading_deg"]
             distance = pred["distance"]
-            raw_payload = {
-                "heading_sin": pred.get("heading_sin"),
-                "heading_cos": pred.get("heading_cos"),
-                "log_distance": pred.get("log_distance"),
-            }
-            return heading, distance, raw_payload
+            return heading, distance
 
-        source_features = torch.stack([feature_cache[item.source].float() for item in batch_pairs]).to(device)
-        target_features = torch.stack([feature_cache[item.target].float() for item in batch_pairs]).to(device)
+        source_features = torch.stack([feature_cache[pair.source].float() for pair in batch_pairs]).to(device)
+        target_features = torch.stack([feature_cache[pair.target].float() for pair in batch_pairs]).to(device)
 
         if model_kind == "dual_path":
             pred = model.forward_features(source_features, target_features)  # type: ignore[attr-defined]
             heading = pred["heading"]
             distance = pred["distance"]
-            return heading, distance, {"heading_raw": heading, "distance_raw": distance}
+            return heading, distance
 
         fused = siamese_fusion(source_features, target_features)
         if hasattr(model, "regression_head"):
             raw = model.regression_head(fused)
             heading = raw[:, 0]
             distance = torch.clamp(raw[:, 1], min=0.0)
-            return heading, distance, {"heading_raw": raw[:, 0], "distance_raw": raw[:, 1]}
+            return heading, distance
 
         pred = model.head(fused)  # type: ignore[attr-defined]
-        return pred["heading_deg"], pred["distance"], {"heading_raw": pred["heading_deg"], "distance_raw": pred["distance"]}
+        return pred["heading_deg"], pred["distance"]
 
 
-def _format_result_line(angle_value: float, distance_value: float, delimiter: str) -> str:
+def _format_output_line(angle: float, distance: float, delimiter: DelimiterMode) -> str:
     if delimiter == "space":
-        return f"{angle_value:.6f} {distance_value:.6f}"
-    return f"{angle_value:.6f}, {distance_value:.6f}"
+        sep = " "
+    else:
+        sep = ", "
+    return f"{angle:.6f}{sep}{distance:.6f}"
 
 
-def _create_result_zip(result_txt: Path, zip_path: Path) -> None:
+def _sanitize_prediction(angle: float, distance: float) -> tuple[float, float]:
+    if not math.isfinite(angle) or not math.isfinite(distance):
+        raise ValueError(f"Non-finite prediction detected: angle={angle}, distance={distance}")
+    wrapped_angle = ((float(angle) + 180.0) % 360.0) - 180.0
+    metric_distance = max(1e-6, float(distance))
+    return wrapped_angle, metric_distance
+
+
+def _verify_submission(
+    expected_pairs: Sequence[PairEntry],
+    output_lines: Sequence[str],
+    output_path: Path,
+) -> None:
+    expected_count = len(expected_pairs)
+    predicted_count = len(output_lines)
+
+    if predicted_count != expected_count:
+        raise RuntimeError(
+            "Submission count mismatch: "
+            f"expected={expected_count}, predicted={predicted_count}. "
+            "Check pair discovery ordering and output formatting."
+        )
+
+    disk_lines = output_path.read_text(encoding="utf-8").splitlines()
+    if len(disk_lines) != expected_count:
+        raise RuntimeError(
+            "Written file line count mismatch: "
+            f"expected={expected_count}, on_disk={len(disk_lines)}"
+        )
+
+    preview_count = min(5, expected_count)
+    print("[verify] pair count matched")
+    print("[verify] first resolved pair IDs:")
+    for pair in expected_pairs[:preview_count]:
+        print(f"  - {pair.pair_id}")
+    print("[verify] first output lines:")
+    for line in output_lines[:preview_count]:
+        print(f"  - {line}")
+
+
+def _create_submission_zip(result_txt: Path, zip_path: Path) -> None:
+    if not result_txt.is_file():
+        raise FileNotFoundError(f"Missing result.txt for zip packaging: {result_txt}")
+
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.write(result_txt, arcname="result.txt")
 
 
-def _assert_submission_decode_units(heading: torch.Tensor, distance: torch.Tensor, context: str) -> None:
-    heading_values = heading.detach().float()
-    distance_values = distance.detach().float()
-
-    if not torch.isfinite(heading_values).all():
-        raise RuntimeError(f"Non-finite heading values encountered during {context}")
-    if not torch.isfinite(distance_values).all():
-        raise RuntimeError(f"Non-finite distance values encountered during {context}")
-
-    wrapped_heading = ((heading_values + 180.0) % 360.0) - 180.0
-    min_heading = float(wrapped_heading.min().item())
-    max_heading = float(wrapped_heading.max().item())
-    if min_heading < -180.0001 or max_heading > 180.0001:
-        raise RuntimeError(
-            "Heading appears to be in a non-degree internal space during "
-            f"{context}: range=[{min_heading:.4f}, {max_heading:.4f}]"
-        )
-
-    min_distance = float(distance_values.min().item())
-    if min_distance <= 0.0:
-        raise RuntimeError(
-            "Distance appears to be in a non-metric internal space during "
-            f"{context}: min={min_distance:.6f}"
-        )
-
-
-def _print_submission_decode_debug(
-    raw_payload: dict[str, torch.Tensor | None],
-    heading: torch.Tensor,
-    distance: torch.Tensor,
-    max_samples: int,
-) -> None:
-    if max_samples <= 0:
-        return
-
-    count = min(max_samples, int(heading.shape[0]))
-    if count <= 0:
-        return
-
-    print("Submission decode debug samples:")
-    for idx in range(count):
-        heading_sin = raw_payload.get("heading_sin")
-        heading_cos = raw_payload.get("heading_cos")
-        log_distance = raw_payload.get("log_distance")
-        heading_raw = raw_payload.get("heading_raw")
-        distance_raw = raw_payload.get("distance_raw")
-
-        sin_text = "n/a" if heading_sin is None else f"{float(heading_sin[idx].item()):.4f}"
-        cos_text = "n/a" if heading_cos is None else f"{float(heading_cos[idx].item()):.4f}"
-        log_dist_text = "n/a" if log_distance is None else f"{float(log_distance[idx].item()):.4f}"
-        heading_raw_text = "n/a" if heading_raw is None else f"{float(heading_raw[idx].item()):.4f}"
-        distance_raw_text = "n/a" if distance_raw is None else f"{float(distance_raw[idx].item()):.4f}"
-
-        decoded_heading = float((((heading[idx].item() + 180.0) % 360.0) - 180.0))
-        decoded_distance = float(distance[idx].item())
-        print(
-            f"  sample[{idx}] raw(rot_sin={sin_text}, rot_cos={cos_text}, rot_raw={heading_raw_text}, "
-            f"dist_log={log_dist_text}, dist_raw={distance_raw_text}) "
-            f"-> heading_deg={decoded_heading:.4f}, distance_m={decoded_distance:.4f}"
-        )
-
-
-def _log_submission_layout(root: Path, pairs: Sequence[SubmissionPair]) -> None:
-    train_annotation_dir = None
-    if (root / "train").is_dir() and collect_annotation_json_paths(root / "train"):
-        train_annotation_dir = root / "train"
-
-    test_annotation_dir = _resolve_official_test_annotation_dir(root)
-    tour_annotation_dir = None
-    for candidate in (root / "test_tour", root / "tour"):
-        if candidate.is_dir() and collect_annotation_json_paths(candidate):
-            tour_annotation_dir = candidate
-            break
-
-    train_image_dir = None
-    for candidate in (root / "train" / "drone", root / "train_tour", root / "train"):
-        if candidate.is_dir():
-            train_image_dir = candidate
-            break
-
-    test_image_dir = None
-    for candidate in (root / "test" / "drone", root / "test", root / "test_tour"):
-        if candidate.is_dir():
-            test_image_dir = candidate
-            break
-
-    tour_image_dir = None
-    for candidate in (root / "test_tour" / "drone", root / "test_tour", root / "tour"):
-        if candidate.is_dir():
-            tour_image_dir = candidate
-            break
-
-    print("Resolved PairUAV layout:")
-    print(f"  data_root={root}")
-    print(f"  train_image_dir={train_image_dir}")
-    print(f"  train_annotation_dir={train_annotation_dir}")
-    print(f"  test_image_dir={test_image_dir}")
-    print(f"  test_annotation_dir={test_annotation_dir}")
-    print(f"  tour_annotation_dir={tour_annotation_dir}")
-    print(f"  tour_image_dir={tour_image_dir}")
-    print(f"  test_pair_count={len(pairs)}")
-
-    preview_count = min(5, len(pairs))
-    if preview_count > 0:
-        print("  first 5 official test pairs:")
-        for item in pairs[:preview_count]:
-            print(f"    {item.pair_id} -> {item.source_ref} || {item.target_ref}")
-
-
-def _resolve_submission_match_store(
-    model: torch.nn.Module,
-    model_kind: str,
-    pairs: Sequence[SubmissionPair],
-    match_root: str | None,
-    match_index_file: str | None,
-    match_missing_policy: str,
-) -> OfflineMatchFeatureStore | None:
-    if model_kind != "geopairnet":
-        return None
-
-    if bool(getattr(model, "no_match_features", False)):
-        print("Match features are disabled in the checkpoint model config (no_match_features=True).")
-        return None
-
-    policy = match_missing_policy.lower().strip()
-    if policy not in {"disable", "error"}:
-        policy = "disable"
-
-    if not match_root:
-        message = (
-            "Match features expected but no --match-root was provided "
-            "(expected test_matches_data/ for official pipeline)."
-        )
-        if policy == "error":
-            raise FileNotFoundError(message)
-        print(f"WARNING: {message} Entering no-match-features fallback mode.")
-        return None
-
-    root_path = Path(match_root).expanduser().resolve()
-    if not root_path.is_dir():
-        message = f"Match root does not exist: {root_path}"
-        if policy == "error":
-            raise FileNotFoundError(message)
-        print(f"WARNING: {message}. Entering no-match-features fallback mode.")
-        return None
-
-    index_path = str(Path(match_index_file).expanduser().resolve()) if match_index_file else None
-    store = OfflineMatchFeatureStore(
-        match_root=str(root_path),
-        index_file=index_path,
-        feature_dim=int(getattr(model, "match_feature_dim", 8)),
-    )
-
-    sample_count = min(5, len(pairs))
-    missing = 0
-    reverse_failures = 0
-    reverse_checked = 0
-    if sample_count > 0:
-        print("Match alignment check (official test samples):")
-    for item in pairs[:sample_count]:
-        probe = store.probe(item.source_ref, item.target_ref)
-        status = "FOUND" if probe.found else "MISSING"
-        reverse_text = "reverse" if probe.used_reverse else "direct"
-        print(f"  {item.pair_id}: {status} ({reverse_text})")
-        if not probe.found:
-            missing += 1
-            continue
-
-        reverse_probe = store.probe(item.target_ref, item.source_ref)
-        if reverse_probe.found and (probe.used_reverse ^ reverse_probe.used_reverse):
-            forward_feat = store.get(item.source_ref, item.target_ref)
-            reverse_feat = store.get(item.target_ref, item.source_ref)
-            reverse_checked += 1
-            if abs(float(forward_feat[2] + reverse_feat[2])) > 2e-2:
-                reverse_failures += 1
-            if abs(float(forward_feat[3] + reverse_feat[3])) > 2e-2:
-                reverse_failures += 1
-
-    if reverse_checked > 0:
-        print(
-            f"  reverse-pair consistency checks: {reverse_checked} samples, "
-            f"failures={reverse_failures}"
-        )
-
-    if missing > 0 or reverse_failures > 0:
-        message = f"Match alignment failed (missing={missing}, reverse_failures={reverse_failures})"
-        if policy == "error":
-            raise RuntimeError(message)
-        print(f"WARNING: {message}. Entering no-match-features fallback mode.")
-        return None
-
-    print(f"Match features enabled for submission: root={root_path}, index={index_path}")
-    return store
-
-
-def _verify_submission_output(
-    pairs: Sequence[SubmissionPair],
-    first_output_lines: Sequence[str],
-    predicted_count: int,
-    expected_count: int,
-) -> None:
-    print("Verification summary:")
-    print(f"  Expected pairs: {expected_count}")
-    print(f"  Predicted lines: {predicted_count}")
-
-    if predicted_count != expected_count:
-        raise RuntimeError(
-            "Submission line count mismatch: "
-            f"expected {expected_count}, got {predicted_count}."
-        )
-
-    unique_pair_ids = len({item.pair_id for item in pairs})
-    if unique_pair_ids != len(pairs):
-        raise RuntimeError(
-            "Pair-order ambiguity detected: pair ids are not unique "
-            f"(unique={unique_pair_ids}, total={len(pairs)})."
-        )
-
-    preview_count = min(10, len(pairs))
-    print(f"  First {preview_count} official pair ids:")
-    for item in pairs[:preview_count]:
-        official_pair_id = item.pair_id.split("::", 1)[0]
-        print(f"    {official_pair_id} -> {item.source_ref} || {item.target_ref}")
-
-    print(f"  First {preview_count} output lines:")
-    for line in first_output_lines[:preview_count]:
-        print(f"    {line}")
-
-
 def generate_submission(
-    checkpoint: str,
+    checkpoint: str | None,
     cache_dir: str | None = None,
     pairuav_root: str | None = None,
     output: str = "result.txt",
-    split: str = "query",
-    pair_order: str = "official",
-    delimiter: str = "comma",
+    pair_order: PairOrderMode = "official",
+    delimiter: DelimiterMode = "comma",
     verify: bool = False,
+    zip_output: str | None = None,
     dry_run_zip: str | None = None,
-    match_root: str | None = None,
-    match_index_file: str | None = None,
-    match_missing_policy: str = "disable",
-    decode_debug_samples: int = 0,
     safe_submission_mode: bool = False,
-    use_ema: bool = False,
 ) -> None:
-    """Generate result.txt for CodaBench submission."""
-    _ = split
-    safe_overrides: list[str] = []
+    """Generate result.txt for CodaBench submission with strict parity checks."""
     if safe_submission_mode:
-        if pair_order != "official":
-            pair_order = "official"
-            safe_overrides.append("pair_order=official")
-        if not verify:
-            verify = True
-            safe_overrides.append("verify=True")
-        if use_ema:
-            use_ema = False
-            safe_overrides.append("use_ema=False")
-        if match_missing_policy != "disable":
-            match_missing_policy = "disable"
-            safe_overrides.append("match_missing_policy=disable")
+        pair_order = "official"
+        delimiter = "comma"
+        verify = True
 
-    if safe_submission_mode:
-        print("safe_submission_mode enabled")
-        if safe_overrides:
-            print("safe_submission_mode overrides:")
-            for item in safe_overrides:
-                print(f"  - {item}")
-        else:
-            print("safe_submission_mode overrides: none")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     root = resolve_pairuav_root(pairuav_root)
-    require_official_order = pair_order == "official"
-
-    model, model_kind, state_source = _load_model(checkpoint, device, use_ema=use_ema)
-    pairs, pair_source = _resolve_submission_pairs(
-        root=root,
-        require_official_order=require_official_order,
-    )
+    pairs, pair_source = _discover_pairs(root, pair_order=pair_order)
     if not pairs:
         raise RuntimeError(f"No test pairs were discovered under {root}.")
-
-    _log_submission_layout(root, pairs)
-
-    resolved_match_root = match_root
-    resolved_match_index_file = match_index_file
-    if resolved_match_root is None:
-        resolved_match_root = _auto_match_root(root, split_tag="test")
-        if resolved_match_root is not None:
-            print(f"Detected test match root: {resolved_match_root}")
-    if resolved_match_index_file is None:
-        resolved_match_index_file = _auto_match_index_file(resolved_match_root)
-        if resolved_match_index_file is not None:
-            print(f"Detected test match index: {resolved_match_index_file}")
-
-    match_store = _resolve_submission_match_store(
-        model=model,
-        model_kind=model_kind,
-        pairs=pairs,
-        match_root=resolved_match_root,
-        match_index_file=resolved_match_index_file,
-        match_missing_policy=match_missing_policy,
-    )
-
-    pair_paths = [(item.source, item.target) for item in pairs]
-
-    unique_images = sorted({path for pair in pair_paths for path in pair}, key=lambda path: str(path).lower())
-    feature_cache = _extract_features(model, model_kind, unique_images, device, root, cache_dir=cache_dir)
 
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    batch_size = 64 if model_kind in {"pose_lite", "geopairnet"} else 32
-    print(f"Generating submission -> {output_path}")
-    print(
-        f"  Pairs: {len(pairs)} | Unique images: {len(unique_images)} | "
-        f"Model: {model_kind} | Pair order source: {pair_source} | checkpoint_state={state_source}"
-    )
+    print(f"Resolved PairUAV root: {root}")
+    print(f"Pair order source: {pair_source}")
+    print(f"Pair count: {len(pairs)}")
 
-    written_line_count = 0
-    first_output_lines: list[str] = []
-    printed_decode_debug = False
+    output_lines: list[str] = []
 
-    with output_path.open("w", encoding="utf-8", newline="") as handle:
+    if dry_run_zip is not None:
+        print("Dry-run mode enabled: writing placeholder predictions only.")
+        output_lines = [_format_output_line(0.0, 1.0, delimiter="comma") for _ in pairs]
+    else:
+        if checkpoint is None:
+            raise ValueError("--checkpoint is required unless --dry-run-zip is used")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model, model_kind = _load_model(checkpoint, device)
+
+        unique_images = sorted(
+            {pair.source for pair in pairs}.union({pair.target for pair in pairs}),
+            key=lambda path: _natural_sort_key(str(path.relative_to(root)).replace("\\", "/")),
+        )
+        feature_cache = _extract_features(model, model_kind, unique_images, device, root, cache_dir=cache_dir)
+
+        batch_size = 64 if model_kind in {"pose_lite", "geopairnet"} else 32
+        print(f"Generating submission -> {output_path}")
+        print(f"  Model: {model_kind} | Unique images: {len(unique_images)} | Batch size: {batch_size}")
+
         for start in range(0, len(pairs), batch_size):
-            batch_items = pairs[start:start + batch_size]
-            heading, distance, raw_payload = _predict_pair_batch(
-                model,
-                model_kind,
-                batch_items,
-                feature_cache,
-                device,
-                match_store=match_store,
-            )
-
-            _assert_submission_decode_units(heading, distance, context=f"submission batch start={start}")
-            if decode_debug_samples > 0 and not printed_decode_debug:
-                _print_submission_decode_debug(raw_payload, heading, distance, max_samples=decode_debug_samples)
-                printed_decode_debug = True
+            batch_pairs = pairs[start:start + batch_size]
+            heading, distance = _predict_pair_batch(model, model_kind, batch_pairs, feature_cache, device)
 
             heading_values = heading.detach().cpu().tolist()
             distance_values = distance.detach().cpu().tolist()
             for angle, dist in zip(heading_values, distance_values):
-                angle_value = ((float(angle) + 180.0) % 360.0) - 180.0
-                distance_value = max(0.0, float(dist))
-                line = _format_result_line(
-                    angle_value=angle_value,
-                    distance_value=distance_value,
-                    delimiter=delimiter,
-                )
-                handle.write(f"{line}\n")
-                written_line_count += 1
-                if len(first_output_lines) < 10:
-                    first_output_lines.append(line)
+                wrapped_angle, metric_distance = _sanitize_prediction(float(angle), float(dist))
+                output_lines.append(_format_output_line(wrapped_angle, metric_distance, delimiter=delimiter))
 
-    expected_count = len(pairs)
-    if written_line_count != expected_count:
-        raise RuntimeError(
-            "Generated line count mismatch: "
-            f"expected {expected_count}, wrote {written_line_count}."
-        )
-
-    if verify:
-        _verify_submission_output(
-            pairs=pairs,
-            first_output_lines=first_output_lines,
-            predicted_count=written_line_count,
-            expected_count=expected_count,
-        )
-
-    if dry_run_zip:
-        zip_path = Path(dry_run_zip)
-        _create_result_zip(result_txt=output_path, zip_path=zip_path)
-        print(f"Dry-run zip created: {zip_path} (result.txt at archive root)")
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        for line in output_lines:
+            handle.write(line + "\n")
 
     print(f"Result written to {output_path}")
+
+    if verify:
+        _verify_submission(expected_pairs=pairs, output_lines=output_lines, output_path=output_path)
+
+    if zip_output is not None:
+        zip_path = Path(zip_output)
+        _create_submission_zip(output_path, zip_path)
+        print(f"Packaged zip: {zip_path}")
+
+    if dry_run_zip is not None:
+        dry_run_zip_path = Path(dry_run_zip)
+        _create_submission_zip(output_path, dry_run_zip_path)
+        print(f"Dry-run zip ready: {dry_run_zip_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Model checkpoint path (required unless --dry-run-zip is set)",
+    )
     parser.add_argument("--cache", type=str)
     parser.add_argument(
         "--pairuav-root",
@@ -1026,62 +731,45 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="result.txt")
     parser.add_argument(
         "--pair-order",
+        type=str,
         choices=["official", "auto"],
         default="official",
-        help="Use strict official processed test JSON order or fallback auto discovery.",
+        help="Submission ordering mode. official is required for leaderboard parity.",
     )
     parser.add_argument(
         "--delimiter",
+        type=str,
         choices=["comma", "space"],
         default="comma",
-        help="Output delimiter format for result lines.",
+        help="Result line delimiter. Challenge canonical format is comma.",
     )
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Enable strict verification output (counts + first 10 pair ids + first 10 lines).",
+        help="Enable strict pair-count and preview verification.",
+    )
+    parser.add_argument(
+        "--zip",
+        dest="zip_output",
+        type=str,
+        default=None,
+        help="Optional zip output path. result.txt is stored at zip root.",
     )
     parser.add_argument(
         "--dry-run-zip",
         type=str,
         default=None,
-        help="Optional zip output path to package result.txt at archive root.",
-    )
-    parser.add_argument(
-        "--match-root",
-        type=str,
-        default=None,
-        help="Optional root directory containing processed SuperGlue match summaries for test pairs.",
-    )
-    parser.add_argument(
-        "--match-index-file",
-        type=str,
-        default=None,
-        help="Optional CSV index mapping (source,target)->match summary file.",
-    )
-    parser.add_argument(
-        "--match-missing-policy",
-        choices=["disable", "error"],
-        default="disable",
-        help="Behavior when match features are expected but missing/misaligned.",
-    )
-    parser.add_argument(
-        "--decode-debug-samples",
-        type=int,
-        default=0,
-        help="Print raw/decode details for N submission samples.",
+        help="Create a dry-run zip with placeholder result.txt at zip root.",
     )
     parser.add_argument(
         "--safe-submission-mode",
         action="store_true",
-        help="Force strict official order and verification safeguards for upload-ready submissions.",
-    )
-    parser.add_argument(
-        "--use-ema",
-        action="store_true",
-        help="Use ema_state_dict from checkpoint if available.",
+        help="Force official order + comma format + verification.",
     )
     args = parser.parse_args()
+
+    if args.checkpoint is None and args.dry_run_zip is None:
+        parser.error("--checkpoint is required unless --dry-run-zip is used")
 
     generate_submission(
         checkpoint=args.checkpoint,
@@ -1090,12 +778,8 @@ if __name__ == "__main__":
         output=args.output,
         pair_order=args.pair_order,
         delimiter=args.delimiter,
-        verify=args.verify,
+        verify=bool(args.verify),
+        zip_output=args.zip_output,
         dry_run_zip=args.dry_run_zip,
-        match_root=args.match_root,
-        match_index_file=args.match_index_file,
-        match_missing_policy=args.match_missing_policy,
-        decode_debug_samples=args.decode_debug_samples,
-        safe_submission_mode=args.safe_submission_mode,
-        use_ema=args.use_ema,
+        safe_submission_mode=bool(args.safe_submission_mode),
     )
