@@ -5,6 +5,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class DenseCorrelationVolume(nn.Module):
+    """Computes a 4D correlation volume between source and target feature maps."""
+    def __init__(self, in_channels: int = 2048, downsample_dim: int = 256):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, downsample_dim, kernel_size=1, bias=False)
+        self.bn = nn.BatchNorm2d(downsample_dim)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, source_spatial: torch.Tensor, target_spatial: torch.Tensor) -> torch.Tensor:
+        s = self.relu(self.bn(self.proj(source_spatial)))
+        t = self.relu(self.bn(self.proj(target_spatial)))
+        
+        B, C, H, W = s.shape
+        s_flat = s.view(B, C, -1)
+        t_flat = t.view(B, C, -1)
+
+        s_flat = F.normalize(s_flat, p=2, dim=1)
+        t_flat = F.normalize(t_flat, p=2, dim=1)
+
+        volume = torch.bmm(s_flat.transpose(1, 2), t_flat)
+        fused_volume = volume.view(B, H * W, H, W)
+        return fused_volume
+
+
 class PairFusion(nn.Module):
     """Fuse global features with local correspondence and geometry summaries."""
 

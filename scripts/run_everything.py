@@ -642,6 +642,7 @@ def main() -> None:
             prep_cmd = [
                 sys.executable,
                 "-u",
+                str(REPO_ROOT / "scripts" / "prepare_pairuav_data.py"),
                 "--workdir",
                 str(prep_workdir),
                 "--download-tool",

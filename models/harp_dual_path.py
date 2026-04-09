@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 from models.baseline import siamese_fusion
+from models.fusion import DenseCorrelationVolume
 
 
 class BackboneSpatial(nn.Module):
@@ -156,8 +157,11 @@ class HARPDualPath(nn.Module):
     def __init__(self, frozen: bool = True, use_gate: bool = True):
         super().__init__()
         self.backbone = BackboneSpatial(frozen=frozen)
+        
+        self.corr_volume = DenseCorrelationVolume(in_channels=2048, downsample_dim=256)
+        
         self.fusion = nn.Sequential(
-            nn.Conv2d(8192, 512, 1, bias=False),   # 1×1 projection
+            nn.Conv2d(49, 512, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
         )
@@ -172,16 +176,16 @@ class HARPDualPath(nn.Module):
     def forward(self, source: torch.Tensor, target: torch.Tensor) -> dict:
         f_s = self.backbone(source)    # (B, 2048, 7, 7)
         f_t = self.backbone(target)
-        fused = siamese_fusion_spatial(f_s, f_t)  # (B, 8192, 7, 7)
-        spatial = self.fusion(fused)
+        volume = self.corr_volume(f_s, f_t)  # (B, 49, 7, 7)
+        spatial = self.fusion(volume)
         return self._forward_spatial(spatial)
 
     # ----- cached-feature forward (Phase 1-2) -----
     def forward_features(self, feat_s: torch.Tensor,
                          feat_t: torch.Tensor) -> dict:
         """Accept pre-extracted 7×7×2048 tensors directly."""
-        fused = siamese_fusion_spatial(feat_s, feat_t)
-        spatial = self.fusion(fused)
+        volume = self.corr_volume(feat_s, feat_t)
+        spatial = self.fusion(volume)
         return self._forward_spatial(spatial)
 
     def _forward_spatial(self, spatial: torch.Tensor) -> dict:
