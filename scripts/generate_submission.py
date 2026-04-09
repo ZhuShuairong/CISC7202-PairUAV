@@ -142,8 +142,8 @@ def _build_image_index(root: Path) -> tuple[dict[str, Path], dict[str, list[Path
 def _resolve_image_ref(
     ref: str,
     root: Path,
-    by_relative: dict[str, Path],
-    by_name: dict[str, list[Path]],
+    by_relative: dict[str, Path] | None,
+    by_name: dict[str, list[Path]] | None,
 ) -> Path | None:
     candidate = Path(ref)
     if candidate.is_absolute() and candidate.exists():
@@ -159,12 +159,13 @@ def _resolve_image_ref(
         if prefixed.exists():
             return prefixed
 
-    if normalized in by_relative:
+    if by_relative is not None and normalized in by_relative:
         return by_relative[normalized]
 
-    matches = by_name.get(Path(normalized).name.lower(), [])
-    if len(matches) == 1:
-        return matches[0]
+    if by_name is not None:
+        matches = by_name.get(Path(normalized).name.lower(), [])
+        if len(matches) == 1:
+            return matches[0]
 
     return None
 
@@ -172,10 +173,11 @@ def _resolve_image_ref(
 def _parse_manifest(
     manifest: Path,
     root: Path,
-    by_relative: dict[str, Path],
-    by_name: dict[str, list[Path]],
-) -> list[PairEntry]:
+    by_relative: dict[str, Path] | None,
+    by_name: dict[str, list[Path]] | None,
+) -> tuple[list[PairEntry], bool]:
     pairs: list[PairEntry] = []
+    had_unresolved = False
 
     with manifest.open("r", encoding="utf-8", newline="") as handle:
         for raw_line in handle:
@@ -198,6 +200,7 @@ def _parse_manifest(
             source = _resolve_image_ref(source_ref, root, by_relative, by_name)
             target = _resolve_image_ref(target_ref, root, by_relative, by_name)
             if source is None or target is None:
+                had_unresolved = True
                 continue
 
             pair_index = len(pairs) + 1
@@ -211,23 +214,24 @@ def _parse_manifest(
                 )
             )
 
-    return pairs
+    return pairs, had_unresolved
 
 
 def _collect_official_json_pairs(
     root: Path,
-    by_relative: dict[str, Path],
-    by_name: dict[str, list[Path]],
-) -> list[PairEntry]:
+    by_relative: dict[str, Path] | None,
+    by_name: dict[str, list[Path]] | None,
+) -> tuple[list[PairEntry], bool]:
     test_root = root / "test"
     if not test_root.is_dir():
-        return []
+        return [], False
 
     json_paths = sorted(
         [path for path in test_root.rglob("*.json") if path.is_file()],
         key=lambda path: _natural_sort_key(str(path.relative_to(test_root)).replace("\\", "/")),
     )
     pairs: list[PairEntry] = []
+    had_unresolved = False
 
     for json_path in json_paths:
         with json_path.open("r", encoding="utf-8") as handle:
@@ -243,6 +247,7 @@ def _collect_official_json_pairs(
         source = _resolve_image_ref(source_ref, root, by_relative, by_name)
         target = _resolve_image_ref(target_ref, root, by_relative, by_name)
         if source is None or target is None:
+            had_unresolved = True
             continue
 
         pair_index = len(pairs) + 1
@@ -256,7 +261,7 @@ def _collect_official_json_pairs(
             )
         )
 
-    return pairs
+    return pairs, had_unresolved
 
 
 def _group_image_sets(directory: Path) -> dict[str, list[Path]]:
@@ -293,25 +298,39 @@ def _discover_pairs(
     root: Path,
     pair_order: PairOrderMode = "official",
 ) -> tuple[list[PairEntry], str]:
-    by_relative, by_name, _ = _build_image_index(root)
-
-    json_pairs = _collect_official_json_pairs(root, by_relative, by_name)
-    if json_pairs:
-        return json_pairs, "official:test_json"
-
-    for base in (root / "test", root / "test_tour", root):
-        for name in PAIR_MANIFEST_NAMES:
-            candidate = base / name
-            if candidate.is_file():
-                pairs = _parse_manifest(candidate, root, by_relative, by_name)
-                if pairs:
-                    return pairs, f"official:manifest:{candidate}"
-
     if pair_order == "official":
+        fast_json_pairs, fast_json_unresolved = _collect_official_json_pairs(root, None, None)
+        if fast_json_pairs and not fast_json_unresolved:
+            return fast_json_pairs, "official:test_json"
+
+        for base in (root / "test", root / "test_tour", root):
+            for name in PAIR_MANIFEST_NAMES:
+                candidate = base / name
+                if candidate.is_file():
+                    pairs, unresolved = _parse_manifest(candidate, root, None, None)
+                    if pairs and not unresolved:
+                        return pairs, f"official:manifest:{candidate}"
+
+        by_relative, by_name, _ = _build_image_index(root)
+
+        json_pairs, _ = _collect_official_json_pairs(root, by_relative, by_name)
+        if json_pairs:
+            return json_pairs, "official:test_json"
+
+        for base in (root / "test", root / "test_tour", root):
+            for name in PAIR_MANIFEST_NAMES:
+                candidate = base / name
+                if candidate.is_file():
+                    pairs, _ = _parse_manifest(candidate, root, by_relative, by_name)
+                    if pairs:
+                        return pairs, f"official:manifest:{candidate}"
+
         raise FileNotFoundError(
             "Official pair-order mode requires test JSON pair annotations or a pair manifest under the processed "
             f"PairUAV root, but none were found in {root}."
         )
+
+    by_relative, by_name, _ = _build_image_index(root)
 
     split_dirs = _find_split_pair_dirs(root)
     if split_dirs is None:

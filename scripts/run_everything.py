@@ -171,6 +171,29 @@ def validate_pairuav_root(pairuav_root: Path) -> tuple[int, int]:
     return len(pairs), len(unique_images)
 
 
+def _find_first_json_file(root: Path) -> Path | None:
+    if not root.is_dir():
+        return None
+
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir(), key=lambda path: path.name.lower())
+        except FileNotFoundError:
+            continue
+
+        for entry in entries:
+            if entry.is_file() and entry.suffix.lower() == ".json":
+                return entry
+
+        for entry in reversed(entries):
+            if entry.is_dir():
+                stack.append(entry)
+
+    return None
+
+
 def has_annotation_json(directory: Path) -> bool:
     if not directory.is_dir():
         return False
@@ -304,7 +327,16 @@ def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path,
                     "Official annotation mode requested, but train annotations were not found under "
                     f"{supervision_root}"
                 )
-            dataset = PairUAVAnnotationDataset(str(supervision_root), max_pairs=2, seed=42, is_val=True)
+            first_json = _find_first_json_file(annotation_root)
+            if first_json is None:
+                raise RuntimeError(f"No annotation JSON files were found under {annotation_root}")
+            dataset = PairUAVAnnotationDataset(
+                str(supervision_root),
+                max_pairs=1,
+                json_paths=[first_json],
+                seed=42,
+                is_val=True,
+            )
             source, target, meta = dataset[0]
             return (
                 f"source={tuple(source.shape)} target={tuple(target.shape)} "
@@ -313,14 +345,23 @@ def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path,
 
         check("official annotation sample", annotation_dataset_sample)
 
+    official_pairs_cache: tuple[list[object], str] | None = None
+
+    def _get_official_pairs() -> tuple[list[object], str]:
+        nonlocal official_pairs_cache
+        if official_pairs_cache is None:
+            official_pairs_cache = _discover_pairs(pairuav_root, pair_order="official")
+        return official_pairs_cache
+
     def pairuav_layout() -> str:
-        test_json_files, test_images = validate_pairuav_root(pairuav_root)
-        return f"test_json_files={test_json_files} test_images={test_images}"
+        pairs, source = _get_official_pairs()
+        unique_images = {pair.source for pair in pairs}.union({pair.target for pair in pairs})
+        return f"pairs={len(pairs)} source={source} test_images={len(unique_images)}"
 
     check("pairuav layout", pairuav_layout)
 
     def submission_order_check() -> str:
-        pairs, source = _discover_pairs(pairuav_root, pair_order="official")
+        pairs, source = _get_official_pairs()
         if not pairs:
             raise RuntimeError("No submission pairs discovered")
         first_pair = pairs[0]
@@ -601,7 +642,6 @@ def main() -> None:
             prep_cmd = [
                 sys.executable,
                 "-u",
-                str(REPO_ROOT / "scripts" / "prepare_pairuav_data.py"),
                 "--workdir",
                 str(prep_workdir),
                 "--download-tool",
@@ -638,7 +678,6 @@ def main() -> None:
                 "PAIRUAV_ROOT",
                 "PAIRUAV_DATA_ROOT",
                 "PAIRUAV_PROCESSED_ROOT",
-                "PAIRUAV_UNIVERSITY_RELEASE",
                 "UNIVERSITY_RELEASE_ROOT",
                 "UNIVERSITY_RELEASE",
             ),
