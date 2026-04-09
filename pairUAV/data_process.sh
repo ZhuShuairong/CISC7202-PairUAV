@@ -1,24 +1,15 @@
 #!/bin/bash
 
-# Your need to first download [University-1652] upon request (Usually I will reply you in 5 minutes). You may use the [request template](https://github.com/layumi/University1652-Baseline/blob/master/Request.md).
-unzip University-Release.zip
+# Uses Data already extracted in AutoDL
+AUTODL_TMP_DIR="/root/autodl-tmp/university"
 
-# Creating training set
+echo "Creating training set from University-Release drone data..."
 mkdir -p train_tour
+cp -r ${AUTODL_TMP_DIR}/University-Release/University-Release/train/drone/* train_tour/
 
-cp -r University-Release/train/drone/* train_tour/
+echo "Creating symlinks for PairUAV data..."
+ln -sf ${AUTODL_TMP_DIR}/PairUAV/train ./train
+ln -sf ${AUTODL_TMP_DIR}/PairUAV/test ./test
+ln -sf ${AUTODL_TMP_DIR}/PairUAV/test_tour ./test_tour
 
-rm -rf University-Release/
-rm -rf University-Release.zip
-
-# Will download the new competition test set
-hf download --repo-type dataset YaxuanLi/UAVM_2026_test --local-dir .
-
-tar -xvf train.tar -C .
-tar -xvf test.tar -C .
-tar -xvf test_tour.tar -C .
-
-rm -rf train.tar
-rm -rf test.tar
-rm -rf test_tour.tar
-rm -rf .cache
+echo "Data setup complete!"
