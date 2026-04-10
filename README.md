@@ -105,16 +105,12 @@ Submission generation uses strict ordering and format checks in `scripts/generat
 
 The system design was inspired by *Frieren* in a practical engineering sense:
 
-- **Calm iteration over flashy jumps**: improve one error source at a time.
-- **Long-memory refinement**: each phase inherits and refines what the previous phase learned.
-- **Precision in the final mile**: small, deliberate corrections (gated residuals) matter most near convergence.
-
-That mindset translated directly into the three-phase schedule and the wide-to-deep correction pattern.
+- **Human v. Elf**: Wide path representing more capability but less temporal awareness, whilst Deep part represents the shorter lifespan with less capability but more iterations
+- **Cross residual**: Not an original idea, but used to pass parts, not full data where deep and wide can learn from each other
 
 ## Environment Notes
 
-- Target environment: AutoDL Ubuntu
-- GPUs used: RTX 3080 Ti / RTX 5090 class
+- 镜像 PyTorch  2.8.0 Python  3.12(ubuntu22.04) CUDA: 12.8 GPU: RTX 3080 Ti(12GB) * 1 CPU: 10 vCPU Intel(R) Xeon(R) Gold 6248 CPU @ 2.50GHz 内存45GB
 - Python and dependency setup follow the challenge starter kit and `requirements.txt`.
 
 ## Acknowledgements
