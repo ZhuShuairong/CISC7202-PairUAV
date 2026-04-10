@@ -77,3 +77,8 @@ Additional references
 - University-1652 request template: https://github.com/layumi/University1652-Baseline/blob/master/Request.md
 
 If you encounter any difficulties, contact the TAs or the challenge organizers.
+
+1. The original University-1652 test set must not be used in any form for training.
+2. The content of the name-masked test set we provided must not be used in any form for training.
+
+To be run on AutoDL with Ubuntu environment and 3080 Ti / 5090 GPU from Nvidia.

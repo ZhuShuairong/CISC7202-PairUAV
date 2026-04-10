@@ -265,7 +265,6 @@ def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path,
                     official_annotations: bool = False,
                     annotation_supervision_root: Path | None = None) -> None:
     from data.dataset import (
-        PairDataset,
         PairUAVAnnotationDataset,
         resolve_train_annotation_dir,
         resolve_train_view_dir,
@@ -303,20 +302,6 @@ def cpu_smoke_check(raw_root: Path, pairuav_root: Path, smoke_log: Path,
     )
 
     check("raw dataset root", lambda: str(resolve_train_view_dir(raw_root)))
-
-    def raw_dataset_sample() -> str:
-        view_dir = resolve_train_view_dir(raw_root)
-        buildings = sorted(os.listdir(view_dir))
-        if not buildings:
-            raise RuntimeError(f"No building directories found in {view_dir}")
-        dataset = PairDataset(str(raw_root), max_pairs=2, buildings=[buildings[0]], seed=42, is_val=True)
-        source, target, meta = dataset[0]
-        return (
-            f"source={tuple(source.shape)} target={tuple(target.shape)} "
-            f"heading={meta['heading']:.3f} distance={meta['distance']:.3f}"
-        )
-
-    check("raw dataset sample", raw_dataset_sample)
 
     if official_annotations:
         def annotation_dataset_sample() -> str:
@@ -982,3 +967,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

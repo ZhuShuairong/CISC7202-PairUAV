@@ -310,44 +310,17 @@ def _resolve_data_split(
     strict_official_only = bool(dataset_cfg.get("strict_official_only", False))
 
     annotation_dir = resolve_train_annotation_dir(root)
-    if mode == "auto":
-        mode = "official" if annotation_dir is not None else "pseudo"
-
-    if strict_official_only and mode != "official":
-        raise RuntimeError(
-            "strict_official_only is enabled but resolved split mode is not official. "
-            f"resolved_mode={mode} root={root}"
-        )
-
-    if mode == "official":
-        if annotation_dir is None:
+    mode = "official"
+    if annotation_dir is None:
             raise FileNotFoundError(f"Official mode requested but no annotations found under {root}")
-        train_json, val_json = split_official_json_paths(annotation_dir, val_ratio=val_ratio, seed=seed)
-        return {
-            "mode": "official",
-            "annotation_dir": annotation_dir,
-            "train_json": train_json,
-            "val_json": val_json,
-        }
-
-    view_dir = resolve_train_view_dir(root)
-    buildings = sorted(path.name for path in view_dir.iterdir() if path.is_dir())
-    if len(buildings) < 2:
-        raise RuntimeError(f"Pseudo mode needs at least 2 building folders under {view_dir}")
-
-    rng = random.Random(seed)
-    rng.shuffle(buildings)
-
-    split_idx = max(1, int(len(buildings) * (1.0 - val_ratio)))
-    split_idx = min(split_idx, len(buildings) - 1)
-    train_buildings = buildings[:split_idx]
-    val_buildings = buildings[split_idx:]
-
+    train_json, val_json = split_official_json_paths(annotation_dir, val_ratio=val_ratio, seed=seed)
     return {
-        "mode": "pseudo",
-        "train_buildings": train_buildings,
-        "val_buildings": val_buildings,
+        "mode": "official",
+        "annotation_dir": annotation_dir,
+        "train_json": train_json,
+        "val_json": val_json,
     }
+
 
 
 def build_dataloaders(
@@ -370,7 +343,6 @@ def build_dataloaders(
     match_root = match_root_override if match_root_override is not None else dataset_cfg.get("match_root")
     match_index = match_index_override if match_index_override is not None else dataset_cfg.get("match_index_file")
 
-    if split["mode"] == "official":
         train_ds = PairUAVDataset(
             root=str(root),
             mode="official",
@@ -955,14 +927,6 @@ def main() -> None:
         raise RuntimeError("Config must include a non-empty 'stages' list.")
     stages = _stage_filter(all_stages, args.stages)
 
-    if split["mode"] == "pseudo":
-        disallowed = [stage["name"] for stage in stages if str(stage["name"]).upper() != "A"]
-        if disallowed:
-            raise RuntimeError(
-                "Pseudo mode is warmup-only and cannot be used for final stage selection. "
-                f"Unsupported stages with pseudo mode: {disallowed}."
-            )
-        print("[DatasetMode] pseudo mode enabled for Stage A warmup only.")
 
     total_epochs = sum(int(stage["epochs"]) for stage in stages)
     global_epoch_idx = 0
@@ -1209,3 +1173,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+

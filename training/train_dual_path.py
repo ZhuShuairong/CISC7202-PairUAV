@@ -257,7 +257,6 @@ def main():
 
     if args.raw:
         from data.dataset import (
-            PairDataset,
             PairUAVAnnotationDataset,
             collect_annotation_json_paths,
             resolve_train_annotation_dir,
@@ -337,32 +336,7 @@ def main():
             annotation_source_text = str(annotation_dir)
             print(f"Using official annotation supervision from {annotation_dir}")
         else:
-            if args.strict_official_only:
-                raise RuntimeError(
-                    "strict_official_only is enabled, but raw mode resolved to pseudo-pairs. "
-                    "Provide --annotations-root with official labels or set --official-annotations true."
-                )
-            if args.phase > 1:
-                raise RuntimeError(
-                    "Pseudo-pair supervision is warmup-only and cannot be used in Phase 2/3. "
-                    "Use official annotations for later phases."
-                )
-            view_dir = resolve_train_view_dir(Path(args.data_root))
-            all_bld = sorted(path.name for path in view_dir.iterdir() if path.is_dir())
-            if len(all_bld) < 2:
-                raise RuntimeError(
-                    f"Need at least 2 building folders for pseudo-pair split, found {len(all_bld)} in {view_dir}"
-                )
-            split_idx = max(1, int(len(all_bld) * 0.8))
-            split_idx = min(split_idx, len(all_bld) - 1)
-            tr = all_bld[:split_idx]
-            va = all_bld[split_idx:]
-            ds_tr = PairDataset(args.data_root, buildings=tr,
-                                max_pairs=960_000, seed=args.seed, is_val=False)
-            ds_va = PairDataset(args.data_root, buildings=va,
-                                max_pairs=20_000, seed=args.seed+1, is_val=True)
-            data_mode_text = "pseudo-pairs"
-            annotation_source_text = "pseudo-from-view-split"
+            raise RuntimeError("strict_official_only is conceptually true now. Provide --annotations-root with official labels or set --official-annotations true.")
     else:
         all_bld = sorted(f.stem for f in Path(args.cache).glob("*.npz"))
         tr = all_bld[:560]
@@ -480,3 +454,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
