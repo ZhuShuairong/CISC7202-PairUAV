@@ -115,5 +115,4 @@ The system design was inspired by *Frieren* in a practical engineering sense:
 
 ## Acknowledgements
 
-- PairUAV / UAVM 2026 organizers for the benchmark and starter kit.
-- Baseline resources from the official challenge repository.
+- This solution uses the official UAVM 2026 starter kit and PairUAV benchmark. The University-1652 dataset and data preparation scripts are based on the publicly available University-1652 baseline and UAVM_2026 repository. Backbone features use ImageNet-pretrained ResNet-50 weights.
