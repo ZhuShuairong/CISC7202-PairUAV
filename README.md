@@ -6,7 +6,7 @@
 
 This repository contains my PairUAV challenge pipeline for ACM MM 2026 UAVM.
 
-## Leaderboard Result (Proof)
+## Leaderboard Result
 
 Participant name: **fXReNet**
 
@@ -17,7 +17,7 @@ Participant name: **fXReNet**
 
 ![Leaderboard proof: fXReNet rank #3](./screenshot.png)
 
-## Benchmark Journey: From 1.27 to 0.35
+## Benchmark: From 1.27 to 0.35
 
 My first serious upload had a **final_score = 1.270123**. The root issue was a post-processing mistake in distance handling: many predictions were emitted as negative values, which are physically invalid for this task and heavily penalized by the relative distance metric.
 
