@@ -10,6 +10,7 @@
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage{graphicx}
+\usepackage{float}
 
 %% Custom commands
 \newcommand{\runrowheight}{0.15\textheight}
@@ -60,10 +61,10 @@
 \begin{document}
 
 %% Title and author
-\title{fXReNet: Dual-Path Architecture with Cross-Residual Gating for Fine-Grained UAV Pose Estimation}
+\title{[DRAFT - NOT FOR SUBMISSION] fXReNet: Dual-Path Architecture with Cross-Residual Gating for Fine-Grained UAV Pose Estimation}
 
-\author{Student Name}
-\email{student.id@university.edu}
+\author{Aaron Zhu}
+\email{aaron.zhu@student.edu}
 \affiliation{%
   \institution{University Name}
   \city{City}
@@ -213,22 +214,7 @@ Angular differences use wrapped L1 loss to ensure continuous gradients across th
 
 \subsection{Training Strategy}
 
-Our three-phase curriculum learning approach progressively increases model capacity:
-
-\begin{table}[h]
-\centering
-\caption{Three-phase training schedule.}
-\label{tab:training_phases}
-\begin{tabular}{lcccc}
-\toprule
-Phase & Epochs & LR & Batch Size & Components \\
-\midrule
-1: Coarse Stabilization & 20 & $5 \times 10^{-4}$ & 256 & Backbone frozen, Gate off \\
-2: Refinement + Gating & 15 & $1 \times 10^{-4}$ & 256 & Backbone frozen, Gate on \\
-3: Joint Fine-tuning & 10 & $1 \times 10^{-5}$ & 128 & Backbone unfrozen, Gate on \\
-\bottomrule
-\end{tabular}
-\end{table}
+Our three-phase curriculum learning approach progressively increases model capacity. Detailed training parameters are provided in Table~\ref{tab:training_phases} in Appendix~\ref{sec:appendix}.
 
 Phase 1 trains only the Wide Path on cached features, establishing a strong baseline. Phase 2 activates the Deep Path and Cross-Residual Gate with auxiliary losses. Phase 3 unfreezes the backbone with reduced learning rate for end-to-end optimization.
 
@@ -276,23 +262,7 @@ The generated \texttt{result.txt} contains one line per test pair with format \t
 
 \subsection{Ablation Study Progress}
 
-During development, we tracked improvement from an initial baseline score of 1.27 to our final 0.35:
-
-\begin{table}[h]
-\centering
-\caption{Progressive improvement trajectory.}
-\label{tab:improvement}
-\begin{tabular}{lccc}
-\toprule
-Version & Angle Rel Err & Dist Rel Err & Final Score \\
-\midrule
-Initial (buggy) & 0.15 & 2.39 & 1.270 \\
-After distance fix & 0.08 & 0.72 & 0.400 \\
-With gating & 0.075 & 0.65 & 0.362 \\
-Final (Phase 3 FT) & \textbf{0.072} & \textbf{0.633} & \textbf{0.352} \\
-\bottomrule
-\end{tabular}
-\end{table}
+During development, we tracked improvement from an initial baseline score of 1.27 to our final 0.35. The progressive improvement trajectory is provided in Table~\ref{tab:improvement} in Appendix~\ref{sec:appendix}.
 
 The primary improvement came from fixing negative distance predictions in post-processing, which violated physical constraints and heavily penalized the relative distance metric.
 
@@ -309,15 +279,7 @@ Our fXReNet submission achieved the following metrics on the PairUAV test set:
     \item \textbf{distance\_rel\_error: 0.632662}
 \end{itemize}
 
-Figure~\ref{fig:leaderboard} shows the leaderboard screenshot confirming our ranking.
-
-\begin{figure}[h]
-\centering
-\includegraphics[width=0.9\linewidth]{screenshot.png}
-\caption{CodaBench leaderboard showing fXReNet at Rank \#3 with final score 0.35225.}
-\label{fig:leaderboard}
-\Description{Leaderboard screenshot showing participant rankings and scores}
-\end{figure}
+The leaderboard screenshot confirming our ranking was submitted separately with this report.
 
 \subsection{Metric Analysis}
 
@@ -343,7 +305,48 @@ The codebase demonstrates strong engineering practices with reproducible pipelin
 
 %% Appendix
 \appendix
-\section{Appendix: Reproducibility Checklist}
+\section{Appendix}\label{sec:appendix}
+
+\subsection{Training Schedule Details}
+
+Table~\ref{tab:training_phases} provides the complete three-phase curriculum learning parameters.
+
+\begin{table}[H]
+\centering
+\caption{Three-phase training schedule.}
+\label{tab:training_phases}
+\begin{tabular}{lcccc}
+\toprule
+Phase & Epochs & LR & Batch Size & Components \\
+\midrule
+1: Coarse Stabilization & 20 & $5 \times 10^{-4}$ & 256 & Backbone frozen, Gate off \\
+2: Refinement + Gating & 15 & $1 \times 10^{-4}$ & 256 & Backbone frozen, Gate on \\
+3: Joint Fine-tuning & 10 & $1 \times 10^{-5}$ & 128 & Backbone unfrozen, Gate on \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Improvement Trajectory}
+
+Table~\ref{tab:improvement} shows the progressive improvement from initial baseline to final submission.
+
+\begin{table}[H]
+\centering
+\caption{Progressive improvement trajectory.}
+\label{tab:improvement}
+\begin{tabular}{lccc}
+\toprule
+Version & Angle Rel Err & Dist Rel Err & Final Score \\
+\midrule
+Initial (buggy) & 0.15 & 2.39 & 1.270 \\
+After distance fix & 0.08 & 0.72 & 0.400 \\
+With gating & 0.075 & 0.65 & 0.362 \\
+Final (Phase 3 FT) & \textbf{0.072} & \textbf{0.633} & \textbf{0.352} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Reproducibility Checklist}
 
 To reproduce our results:
 
