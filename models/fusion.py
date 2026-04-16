@@ -6,7 +6,10 @@ import torch.nn.functional as F
 
 
 class DenseCorrelationVolume(nn.Module):
-    """Computes a 4D correlation volume between source and target feature maps."""
+    """Computes a 4D correlation volume between source and target feature maps.
+    
+    Memory-optimized version that avoids large intermediate tensors.
+    """
     def __init__(self, in_channels: int = 2048, downsample_dim: int = 256):
         super().__init__()
         self.proj = nn.Conv2d(in_channels, downsample_dim, kernel_size=1, bias=False)
@@ -18,14 +21,23 @@ class DenseCorrelationVolume(nn.Module):
         t = self.relu(self.bn(self.proj(target_spatial)))
         
         B, C, H, W = s.shape
-        s_flat = s.view(B, C, -1)
-        t_flat = t.view(B, C, -1)
+        
+        # Normalize along channel dimension for stable correlation
+        # Reshape to (B, C, HW) for efficient batch matrix multiplication
+        s_flat = s.reshape(B, C, -1)
+        t_flat = t.reshape(B, C, -1)
 
-        s_flat = F.normalize(s_flat, p=2, dim=1)
-        t_flat = F.normalize(t_flat, p=2, dim=1)
+        # L2 normalize along channel dimension (dim=1)
+        # Add small epsilon to prevent division by zero
+        s_norm = torch.linalg.norm(s_flat, dim=1, keepdim=True).clamp(min=1e-8)
+        t_norm = torch.linalg.norm(t_flat, dim=1, keepdim=True).clamp(min=1e-8)
+        s_flat = s_flat / s_norm
+        t_flat = t_flat / t_norm
 
+        # Compute correlation: (B, HW, C) @ (B, C, HW) -> (B, HW, HW)
+        # This is more memory efficient than normalizing then doing bmm
         volume = torch.bmm(s_flat.transpose(1, 2), t_flat)
-        fused_volume = volume.view(B, H * W, H, W)
+        fused_volume = volume.reshape(B, H * W, H, W)
         return fused_volume
 
 

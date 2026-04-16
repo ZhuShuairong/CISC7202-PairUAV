@@ -16,9 +16,9 @@ from models.harp_dual_path import HARPDualPath
 from training.loss import phase1_loss, phase2_loss, laplace_nll
 
 PHASE_CFG = {
-    1: dict(epochs=20, lr=5e-4,  bs=256, frozen=True,  gate=False),
-    2: dict(epochs=15, lr=1e-4,  bs=256, frozen=True,  gate=True),
-    3: dict(epochs=10, lr=1e-5,  bs=128, frozen=False, gate=True),
+    1: dict(epochs=20, lr=5e-4,  bs=192, frozen=True,  gate=False),
+    2: dict(epochs=15, lr=1e-4,  bs=192, frozen=True,  gate=True),
+    3: dict(epochs=10, lr=1e-5,  bs=64,  frozen=False, gate=True),
 }
 
 
@@ -76,6 +76,12 @@ def raw_forward(model, batch, dev):
     th = torch.as_tensor(meta["heading"], dtype=torch.float32, device=dev)
     td = torch.as_tensor(meta["distance"], dtype=torch.float32, device=dev)
     pred = model(source, target)
+    
+    # Clamp distance predictions to prevent numerical instability
+    # Distance is modeled as exp(log_distance), so clamp log_distance to reasonable range
+    if "distance" in pred:
+        pred["distance"] = pred["distance"].clamp(min=0.1, max=200.0)
+    
     return pred, {"heading": th, "distance": td}
 
 
@@ -97,31 +103,47 @@ def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scale
     model.train()
     model.phase = 1 if phase == 1 else 2
     t_loss, t_angle, n = 0.0, 0.0, 0
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
         lr = cosine_lr(ep, total_ep, 3, list(optim.param_groups)[0]["lr"])
         optim.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred, tgt = forward_batch(model, batch, dev, use_raw)
             losses = compute_phase_losses(pred, tgt, phase)
 
+        # Check for NaN in loss before backward
+        loss_val = losses["total"].item()
+        if not torch.isfinite(losses["total"]):
+            print(f"  ⚠️  NaN/Inf detected in loss at epoch {ep+1}, step {batch_idx+1}. Skipping batch.")
+            # Reset scaler state to prevent carrying over bad gradients
+            if scaler.is_enabled():
+                scaler.update()  # Skip this batch's gradients
+            continue
+
         if scaler.is_enabled():
             scaler.scale(losses["total"]).backward()
             scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Check for NaN in gradients after clipping
+            has_nan_grad = any(torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
+            if has_nan_grad:
+                print(f"  ⚠️  NaN detected in gradients at epoch {ep+1}, step {batch_idx+1}. Skipping optimizer step.")
+                scaler.update()
+                continue
             scaler.step(optim)
             scaler.update()
         else:
             losses["total"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
 
-        t_loss += losses["total"].item()
+        t_loss += loss_val
         t_angle += losses.get("angle", torch.tensor(0.0)).item()
         n += 1
         if n % 100 == 0:
             print(f"  Ep {ep+1} Step {n}/{len(loader)}  "
-                  f"L={losses['total'].item():.4f}  Lθ={t_angle/n:.4f}  LR={lr:.2e}")
-    return {"loss": t_loss / n, "angle": t_angle / n}
+                  f"L={loss_val:.4f}  Lθ={t_angle/n:.4f}  LR={lr:.2e}")
+    return {"loss": t_loss / max(n, 1), "angle": t_angle / max(n, 1)}
 
 
 @torch.no_grad()

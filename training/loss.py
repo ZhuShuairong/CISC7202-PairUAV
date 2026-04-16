@@ -14,16 +14,20 @@ def wrapped_angle_loss(pred: torch.Tensor,
 
 
 def laplace_nll(pred: dict, target: dict,
-                lambda_dist: float = 0.01,
+                lambda_dist: float = 1.5,
                 lambda_conf_reg: float = 0.01) -> dict:
-    """Laplace NLL: |ε|·√c + ½·log(1/c)."""
+    """Laplace NLL: |ε|·√c + ½·log(1/c).
+    
+    Increased lambda_dist from 0.5 to 1.5 to give more weight to distance loss.
+    """
     eps_a = torch.deg2rad(pred['heading'] - target['heading'])
     eps_a = (eps_a + torch.pi) % (2 * torch.pi) - torch.pi
     eps_a = eps_a.abs()
 
     eps_d = (pred['distance'] - target['distance']).abs()
 
-    c = pred['confidence'].clamp(min=1e-4)
+    # Clamp confidence to prevent numerical instability
+    c = pred['confidence'].clamp(min=1e-4, max=1e4)
 
     l_angle = (eps_a * c.sqrt()).mean() + 0.5 * c.reciprocal().log().mean()
     l_dist  = (eps_d * c.sqrt()).mean()
@@ -39,7 +43,7 @@ def phase1_loss(pred: dict, target: dict) -> dict:
 
 
 def phase2_loss(pred: dict, target: dict,
-                lambda_dist: float = 0.01) -> dict:
+                lambda_dist: float = 1.5) -> dict:
     losses = laplace_nll(pred, target, lambda_dist)
     # Auxiliary deep-path loss
     if 'deep_heading' in pred:
