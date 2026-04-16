@@ -43,7 +43,7 @@ def get_parser():
                    choices=['baseline', 'harp-lite'],
                    help='Model variant')
     p.add_argument('--epochs', type=int, default=30)
-    p.add_argument('--batch-size', type=int, default=48)
+    p.add_argument('--batch-size', type=int, default=128)
     p.add_argument('--lr', type=float, default=1e-4, help='Adam lr')
     p.add_argument('--weight-decay', type=float, default=0.01, help='AdamW wd')
     p.add_argument('--lambda-dist', type=float, default=0.5, help='Distance loss weight')

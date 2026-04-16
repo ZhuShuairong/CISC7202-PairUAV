@@ -66,7 +66,7 @@
     {
       "name": "A",
       "epochs": 4,
-      "batch_size": 128,
+      "batch_size": 384,
       "lr": 0.0008,
       "min_lr": 0.00002,
       "warmup_epochs": 1,
@@ -80,7 +80,7 @@
     {
       "name": "B",
       "epochs": 10,
-      "batch_size": 96,
+      "batch_size": 256,
       "lr": 0.00025,
       "min_lr": 0.000005,
       "warmup_epochs": 1,
@@ -93,7 +93,7 @@
     {
       "name": "C",
       "epochs": 6,
-      "batch_size": 64,
+      "batch_size": 128,
       "lr": 0.00008,
       "min_lr": 0.000001,
       "warmup_epochs": 1,

@@ -457,7 +457,7 @@ def _extract_features(
     device: torch.device,
     root: Path,
     cache_dir: str | None = None,
-    batch_size: int = 32,
+    batch_size: int = 128,
 ) -> dict[Path, Any]:
     transform = models.ResNet50_Weights.IMAGENET1K_V1.transforms()
 
@@ -692,7 +692,7 @@ def generate_submission(
         )
         feature_cache = _extract_features(model, model_kind, unique_images, device, root, cache_dir=cache_dir)
 
-        batch_size = 64 if model_kind in {"pose_lite", "geopairnet"} else 32
+        batch_size = 256 if model_kind in {"pose_lite", "geopairnet"} else 128
         print(f"Generating submission -> {output_path}")
         print(f"  Model: {model_kind} | Unique images: {len(unique_images)} | Batch size: {batch_size}")
 
