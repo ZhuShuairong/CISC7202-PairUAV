@@ -14,7 +14,7 @@ def wrapped_angle_loss(pred: torch.Tensor,
 
 
 def laplace_nll(pred: dict, target: dict,
-                lambda_dist: float = 1.5,
+                lambda_dist: float = 2.0,
                 lambda_conf_reg: float = 0.01) -> dict:
     """Laplace NLL: |ε|·√c + ½·log(1/c).
     

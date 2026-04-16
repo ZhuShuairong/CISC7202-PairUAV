@@ -17,8 +17,8 @@ from training.loss import phase1_loss, phase2_loss, laplace_nll
 
 PHASE_CFG = {
     1: dict(epochs=20, lr=5e-4,  bs=192, frozen=True,  gate=False),
-    2: dict(epochs=15, lr=1e-4,  bs=192, frozen=True,  gate=True),
-    3: dict(epochs=10, lr=1e-5,  bs=64,  frozen=False, gate=True),
+    2: dict(epochs=20, lr=1e-4,  bs=192, frozen=True,  gate=True),
+    3: dict(epochs=20, lr=1e-5,  bs=64,  frozen=False, gate=True),
 }
 
 
