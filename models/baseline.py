@@ -92,8 +92,9 @@ def baseline_distance_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Te
 
 
 def baseline_total_loss(pred: dict, target: dict, 
-                        lambda_dist: float = 0.01) -> torch.Tensor:
+                        lambda_dist: float = 0.01) -> dict:
     """Total loss = L_angle + λ_dist · L_dist."""
     l_angle = baseline_angle_loss(pred['heading_deg'], target['heading'])
     l_dist = baseline_distance_loss(pred['distance'], target['distance'])
-    return l_angle + lambda_dist * l_dist
+    total = l_angle + lambda_dist * l_dist
+    return {'total': total, 'angle': l_angle, 'dist': l_dist}
