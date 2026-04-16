@@ -124,10 +124,14 @@ def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scale
             scaler.unscale_(optim)
             # Gradient clipping to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            # Check for NaN in gradients after clipping
-            has_nan_grad = any(torch.isnan(p.grad).any() for p in model.parameters() if p.grad is not None)
-            if has_nan_grad:
-                print(f"  ⚠️  NaN detected in gradients at epoch {ep+1}, step {batch_idx+1}. Skipping optimizer step.")
+            # Check for NaN/Inf in gradients after clipping
+            has_nonfinite_grad = any(
+                not torch.isfinite(p.grad).all()
+                for p in model.parameters()
+                if p.grad is not None
+            )
+            if has_nonfinite_grad:
+                print(f"  ⚠️  NaN/Inf detected in gradients at epoch {ep+1}, step {batch_idx+1}. Skipping optimizer step.")
                 scaler.update()
                 continue
             scaler.step(optim)
@@ -135,6 +139,14 @@ def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scale
         else:
             losses["total"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            has_nonfinite_grad = any(
+                not torch.isfinite(p.grad).all()
+                for p in model.parameters()
+                if p.grad is not None
+            )
+            if has_nonfinite_grad:
+                print(f"  ⚠️  NaN/Inf detected in gradients at epoch {ep+1}, step {batch_idx+1}. Skipping optimizer step.")
+                continue
             optim.step()
 
         t_loss += loss_val

@@ -305,14 +305,11 @@ def _resolve_data_split(
     dataset_cfg: dict[str, Any],
     seed: int,
 ) -> dict[str, Any]:
-    mode = str(dataset_cfg.get("mode", "auto")).lower()
     val_ratio = float(dataset_cfg.get("val_ratio", 0.1))
-    strict_official_only = bool(dataset_cfg.get("strict_official_only", False))
 
     annotation_dir = resolve_train_annotation_dir(root)
-    mode = "official"
     if annotation_dir is None:
-            raise FileNotFoundError(f"Official mode requested but no annotations found under {root}")
+        raise FileNotFoundError(f"Official mode requested but no annotations found under {root}")
     train_json, val_json = split_official_json_paths(annotation_dir, val_ratio=val_ratio, seed=seed)
     return {
         "mode": "official",
@@ -343,6 +340,7 @@ def build_dataloaders(
     match_root = match_root_override if match_root_override is not None else dataset_cfg.get("match_root")
     match_index = match_index_override if match_index_override is not None else dataset_cfg.get("match_index_file")
 
+    if split["mode"] == "official":
         train_ds = PairUAVDataset(
             root=str(root),
             mode="official",
