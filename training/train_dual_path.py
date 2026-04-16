@@ -76,12 +76,11 @@ def raw_forward(model, batch, dev):
     th = torch.as_tensor(meta["heading"], dtype=torch.float32, device=dev)
     td = torch.as_tensor(meta["distance"], dtype=torch.float32, device=dev)
     pred = model(source, target)
-    
-    # Clamp distance predictions to prevent numerical instability
-    # Distance is modeled as exp(log_distance), so clamp log_distance to reasonable range
+
+    # Keep distance positive without capping upper range.
     if "distance" in pred:
-        pred["distance"] = pred["distance"].clamp(min=0.1, max=200.0)
-    
+        pred["distance"] = pred["distance"].clamp(min=0.1)
+
     return pred, {"heading": th, "distance": td}
 
 
@@ -104,7 +103,7 @@ def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scale
     model.phase = 1 if phase == 1 else 2
     t_loss, t_angle, n = 0.0, 0.0, 0
     for batch_idx, batch in enumerate(loader):
-        lr = cosine_lr(ep, total_ep, 3, list(optim.param_groups)[0]["lr"])
+        current_lr = float(optim.param_groups[0]["lr"])
         optim.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
             pred, tgt = forward_batch(model, batch, dev, use_raw)
@@ -154,7 +153,7 @@ def train_epoch(model, loader, optim, dev, phase, ep, total_ep, amp_dtype, scale
         n += 1
         if n % 100 == 0:
             print(f"  Ep {ep+1} Step {n}/{len(loader)}  "
-                  f"L={loss_val:.4f}  Lθ={t_angle/n:.4f}  LR={lr:.2e}")
+                  f"L={loss_val:.4f}  Lθ={t_angle/n:.4f}  LR={current_lr:.2e}")
     return {"loss": t_loss / max(n, 1), "angle": t_angle / max(n, 1)}
 
 
@@ -271,6 +270,21 @@ def main():
         raise ValueError("--data-root is required when --raw true")
     if not args.raw and not args.cache:
         raise ValueError("--cache is required when --raw false")
+    if not args.raw and args.phase == 3:
+        raise ValueError(
+            "--phase 3 requires --raw true. Cached mode bypasses backbone image encoding "
+            "and cannot perform meaningful phase-3 backbone fine-tuning."
+        )
+    if not args.raw and args.official_annotations == "true":
+        raise ValueError(
+            "--official-annotations true requires --raw true. "
+            "Cached mode uses pseudo labels from cached feature metadata."
+        )
+    if not args.raw and args.strict_official_only:
+        raise ValueError(
+            "--strict-official-only requires --raw true. "
+            "Cached mode does not load official JSON annotations."
+        )
 
     torch.manual_seed(args.seed)
     torch.backends.cudnn.benchmark = True
@@ -286,7 +300,7 @@ def main():
     ep = args.epochs or c["epochs"]
     bs = args.batch_size or c["bs"]
     lr = args.lr or c["lr"]
-    data_mode_text = "cached-features"
+    data_mode_text = "cached-pseudo-labels"
     annotation_source_text = "none"
 
     if args.raw:
@@ -372,13 +386,29 @@ def main():
         else:
             raise RuntimeError("strict_official_only is conceptually true now. Provide --annotations-root with official labels or set --official-annotations true.")
     else:
+        if args.official_annotations != "auto":
+            print(
+                "[DatasetDiagnostics] note: --official-annotations is ignored in cached mode; "
+                "training uses pseudo labels derived from cached feature pairs."
+            )
         all_bld = sorted(f.stem for f in Path(args.cache).glob("*.npz"))
-        tr = all_bld[:560]
-        va = all_bld[560:]
+        if len(all_bld) < 2:
+            raise RuntimeError(
+                f"Cached mode requires at least 2 building cache files (*.npz), got {len(all_bld)} at {args.cache}"
+            )
+        if len(all_bld) >= 700:
+            split_idx = 560
+        else:
+            split_idx = max(1, int(len(all_bld) * 0.8))
+            split_idx = min(split_idx, len(all_bld) - 1)
+
+        tr = all_bld[:split_idx]
+        va = all_bld[split_idx:]
         ds_tr = CachedDataset(args.cache, buildings=tr, max_pairs=960_000,
                               seed=args.seed, preload=True)
         ds_va = CachedDataset(args.cache, buildings=va, max_pairs=20_000,
                               seed=args.seed+1, is_val=True, preload=True)
+        annotation_source_text = f"{args.cache} (pseudo labels from filename geometry)"
 
     loader_kwargs = dict(num_workers=args.workers, pin_memory=True)
     if args.workers > 0:
@@ -417,7 +447,7 @@ def main():
         [p for p in model.parameters() if p.requires_grad],
         lr=lr, weight_decay=0.01)
 
-    mode_text = data_mode_text if args.raw else "cached-features"
+    mode_text = data_mode_text
     print(f"\nPhase {args.phase}: {ep} epochs, LR={lr}, BS={bs} | input={mode_text}")
     best_avg = float("inf")
     best_final_score = float("inf")

@@ -117,6 +117,31 @@ def _safe_load_json(json_path: Path) -> dict[str, Any]:
         return json.load(handle)
 
 
+def _pseudo_pose_from_names(source_name: str, target_name: str) -> tuple[float, float]:
+    src_idx = _view_index_from_name(source_name)
+    tgt_idx = _view_index_from_name(target_name)
+
+    if src_idx is None or tgt_idx is None:
+        return 0.0, 1.0
+
+    src_az = (src_idx - 1) // 3
+    tgt_az = (tgt_idx - 1) // 3
+
+    src_alt = (src_idx - 1) % 3
+    tgt_alt = (tgt_idx - 1) % 3
+
+    heading = (tgt_az - src_az) * 20.0
+    heading = ((heading + 180.0) % 360.0) - 180.0
+
+    circular_diff = abs(tgt_az - src_az)
+    circular_diff = min(circular_diff, 18 - circular_diff)
+    base_distance = (circular_diff / 9.0) * 70.0
+    altitude_penalty = abs(tgt_alt - src_alt) * 8.0
+    distance = max(1.0, base_distance + altitude_penalty)
+
+    return heading, distance
+
+
 def split_official_json_paths(
     annotation_dir: Path,
     val_ratio: float,
@@ -379,9 +404,25 @@ class PairUAVDataset(Dataset):
         self.is_val = is_val
         self.min_distance = min_distance
         self.strict_official_only = strict_official_only
-        self.mode = "official"
+        self.requested_mode = mode.lower().strip()
+        self.annotation_dir = resolve_train_annotation_dir(self.root)
+        self.annotation_source_paths: list[Path] = []
 
-        if self.annotation_dir is None:
+        if self.requested_mode not in {"auto", "official", "pseudo"}:
+            raise ValueError("mode must be one of: auto, official, pseudo")
+
+        if self.requested_mode == "auto":
+            self.mode = "official" if self.annotation_dir is not None else "pseudo"
+        else:
+            self.mode = self.requested_mode
+
+        if self.strict_official_only and self.mode != "official":
+            raise RuntimeError(
+                "strict_official_only is enabled, but resolved dataset mode is not official. "
+                f"requested={self.requested_mode} resolved={self.mode} root={self.root}"
+            )
+
+        if self.mode == "official" and self.annotation_dir is None:
             raise FileNotFoundError(
                 f"Official mode requested but no annotation JSON folder exists under {self.root}"
             )
@@ -418,6 +459,128 @@ class PairUAVDataset(Dataset):
                     normalize,
                 ]
             )
+        else:
+            self.source_transform = transforms.Compose(
+                [
+                    transforms.Resize((image_size, image_size)),
+                    transforms.ToTensor(),
+                    normalize,
+                ]
+            )
+
+        self.target_transform = transforms.Compose(
+            [
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        )
+
+        self._image_path_cache: dict[str, Path] = {}
+
+    def _build_records(
+        self,
+        annotation_dir: Path | None,
+        json_paths: list[Path] | None,
+        buildings: list[str] | None,
+        max_pairs: int | None,
+    ) -> list[PairRecord]:
+        records: list[PairRecord] = []
+
+        if self.mode == "official":
+            assert annotation_dir is not None
+            if json_paths is None:
+                paths = collect_annotation_json_paths(annotation_dir)
+            else:
+                paths = [Path(path) for path in json_paths]
+
+            self.annotation_source_paths = sorted(paths)
+
+            for json_path in paths:
+                payload = _safe_load_json(json_path)
+                source_ref = payload.get("image_a") or payload.get("source")
+                target_ref = payload.get("image_b") or payload.get("target")
+                if not source_ref or not target_ref:
+                    continue
+
+                heading = payload.get("heading_num", payload.get("heading"))
+                distance = payload.get("range_num", payload.get("distance"))
+                if heading is None or distance is None:
+                    continue
+
+                source_ref_norm = _normalize_ref(str(source_ref))
+                target_ref_norm = _normalize_ref(str(target_ref))
+
+                metadata = {
+                    "json_path": str(json_path),
+                    "building": json_path.parent.name,
+                    "azimuth_a": payload.get("azimuth_a"),
+                    "azimuth_b": payload.get("azimuth_b"),
+                    "altitude_a": payload.get("altitude_a"),
+                    "altitude_b": payload.get("altitude_b"),
+                    "overlap": payload.get("overlap"),
+                }
+
+                geometry = build_geometry_features(source_ref_norm, target_ref_norm, metadata)
+                records.append(
+                    PairRecord(
+                        source_ref=source_ref_norm,
+                        target_ref=target_ref_norm,
+                        heading=float(heading),
+                        distance=max(self.min_distance, float(distance)),
+                        source_id=source_ref_norm,
+                        target_id=target_ref_norm,
+                        geometry=geometry,
+                        metadata=metadata,
+                    )
+                )
+
+        else:
+            self.annotation_source_paths = []
+            available_buildings = sorted(path.name for path in self.view_dir.iterdir() if path.is_dir())
+            used_buildings = buildings if buildings is not None else available_buildings
+            used_buildings = [building for building in used_buildings if (self.view_dir / building).is_dir()]
+
+            image_index: dict[str, list[str]] = {}
+            for building in used_buildings:
+                folder = self.view_dir / building
+                names = sorted(
+                    name
+                    for name in (path.name for path in folder.iterdir() if path.is_file())
+                    if Path(name).suffix.lower() in IMAGE_SUFFIXES
+                )
+                if len(names) >= 2:
+                    image_index[building] = names
+
+            rng = random.Random(self.seed)
+            all_pairs: list[tuple[str, str, str]] = []
+            for building, names in image_index.items():
+                for idx in range(len(names)):
+                    for jdx in range(idx + 1, len(names)):
+                        all_pairs.append((building, names[idx], names[jdx]))
+
+            if max_pairs is not None and len(all_pairs) > max_pairs:
+                all_pairs = rng.sample(all_pairs, max_pairs)
+
+            for building, source_name, target_name in all_pairs:
+                heading, distance = _pseudo_pose_from_names(source_name, target_name)
+                source_ref = f"{building}/{source_name}"
+                target_ref = f"{building}/{target_name}"
+                geometry = build_geometry_features(source_name, target_name, metadata={"building": building})
+
+                records.append(
+                    PairRecord(
+                        source_ref=source_ref,
+                        target_ref=target_ref,
+                        heading=heading,
+                        distance=max(self.min_distance, distance),
+                        source_id=source_ref,
+                        target_id=target_ref,
+                        geometry=geometry,
+                        metadata={"building": building, "pseudo": True},
+                    )
+                )
+
         if max_pairs is not None and len(records) > max_pairs:
             rng = random.Random(self.seed)
             records = rng.sample(records, max_pairs)
@@ -526,5 +689,3 @@ class PairUAVDataset(Dataset):
             "mode": self.mode,
         }
         return source_tensor, target_tensor, target
-
-

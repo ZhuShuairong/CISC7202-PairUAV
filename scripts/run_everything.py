@@ -849,6 +849,18 @@ def main() -> None:
     if args.mode == "dual-path":
         train_script = REPO_ROOT / "training" / "train_dual_path.py"
         phases = [int(phase.strip()) for phase in args.phases.split(",") if phase.strip()]
+        if not phases:
+            raise ValueError("--phases must include at least one phase id from {1,2,3}")
+        if not args.raw and 3 in phases:
+            raise ValueError(
+                "--raw false cannot run phase 3. Cached-feature mode bypasses backbone image encoding, "
+                "so phase-3 backbone fine-tuning would be ineffective."
+            )
+        if not args.raw and args.official_annotations:
+            print(
+                "Note: --official-annotations applies only to --raw true. "
+                "Cached mode uses pseudo labels from cached feature pairs."
+            )
         checkpoint_path = checkpoints_dir / "dual_path.pt"
 
         if args.raw:
