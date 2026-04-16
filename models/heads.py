@@ -9,9 +9,9 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class DistanceHeadConfig:
-    log_distance_min: float = 0.0
-    log_distance_max: float = 5.0
-    num_bins: int = 24
+    log_distance_min: float = -0.5
+    log_distance_max: float = 5.5
+    num_bins: int = 48
 
 
 class RotationHead(nn.Module):
@@ -128,13 +128,15 @@ class DistanceHead(nn.Module):
         hard_residual = torch.gather(distance_residual_bins, 1, hard_bin.unsqueeze(1)).squeeze(1)
         log_distance_hard = hard_bin_center + hard_residual
 
-        distance = torch.exp(log_distance_soft)
+        # Clamp log_distance to valid range before exp to prevent NaN/Inf
+        log_distance_clamped = log_distance_soft.clamp(self.config.log_distance_min, self.config.log_distance_max)
+        distance = torch.exp(log_distance_clamped)
 
         output: dict[str, torch.Tensor] = {
             "distance_logits": distance_logits,
             "distance_prob": distance_prob,
             "distance_residual_bins": distance_residual_bins,
-            "log_distance": log_distance_soft,
+            "log_distance": log_distance_clamped,
             "log_distance_hard": log_distance_hard,
             "distance": distance,
             "distance_bin_centers": self.bin_centers,

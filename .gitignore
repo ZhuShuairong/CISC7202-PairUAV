@@ -1,10 +1,34 @@
-# Examples
-Input:
-Added files: []
-Deleted files: []
-Modified files: ['references.bib']
-Current .gitignore Content: (empty)
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-Since only a source/config file (.bib) was modified and there are no build artifacts, dependencies, or temp files in the changes, no ignores are needed.
+# Dependencies
+.venv/
+venv/
+env/
+.env
+.env.local
+.env.*
 
-Output: (empty — output nothing)
+# Logs
+*.log
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+```

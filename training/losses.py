@@ -9,13 +9,13 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class LossWeightConfig:
-    distance_cls_weight: float = 0.35
-    early_rotation_weight: float = 1.25
-    early_distance_weight: float = 0.55
-    mid_rotation_weight: float = 1.0
-    mid_distance_weight: float = 1.0
-    late_rotation_weight: float = 0.8
-    late_distance_weight: float = 1.35
+    distance_cls_weight: float = 0.5
+    early_rotation_weight: float = 0.8
+    early_distance_weight: float = 1.2
+    mid_rotation_weight: float = 0.75
+    mid_distance_weight: float = 1.2
+    late_rotation_weight: float = 0.6
+    late_distance_weight: float = 1.5
 
 
 def _wrapped_angle_deg(pred_deg: torch.Tensor, target_deg: torch.Tensor) -> torch.Tensor:

@@ -43,10 +43,10 @@ def get_parser():
                    choices=['baseline', 'harp-lite'],
                    help='Model variant')
     p.add_argument('--epochs', type=int, default=30)
-    p.add_argument('--batch-size', type=int, default=64)
+    p.add_argument('--batch-size', type=int, default=48)
     p.add_argument('--lr', type=float, default=1e-4, help='Adam lr')
     p.add_argument('--weight-decay', type=float, default=0.01, help='AdamW wd')
-    p.add_argument('--lambda-dist', type=float, default=0.01, help='Distance loss weight')
+    p.add_argument('--lambda-dist', type=float, default=0.5, help='Distance loss weight')
     p.add_argument('--lambda-conf', type=float, default=0.1, help='Conf loss weight (Lite only)')
     p.add_argument('--warmup-epochs', type=int, default=3, help='Linear warmup')
     p.add_argument('--seed', type=int, default=42)
