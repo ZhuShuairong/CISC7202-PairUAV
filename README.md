@@ -1,9 +1,5 @@
 # fXReNet for PairUAV (UAVM 2026)
 
-<div align="center">
-  <img src="./ascii-animation.gif" alt="ASCII animation" width="900" />
-</div>
-
 This repository contains my PairUAV challenge pipeline for ACM MM 2026 UAVM.
 
 ## Leaderboard Result
@@ -100,13 +96,6 @@ python scripts/run_everything.py \
 ```
 
 Submission generation uses strict ordering and format checks in `scripts/generate_submission.py` with `--safe-submission-mode`.
-
-## Frieren-Inspired Design Philosophy
-
-The system design was inspired by *Frieren* in a practical engineering sense:
-
-- **Human v. Elf**: Wide path representing more capability but less temporal awareness, whilst Deep part represents the shorter lifespan with less capability but more iterations
-- **Cross residual**: Not an original idea, but used to pass parts, not full data where deep and wide can learn from each other
 
 ## Environment Notes
 
